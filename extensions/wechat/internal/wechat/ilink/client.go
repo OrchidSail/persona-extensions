@@ -55,7 +55,7 @@ type Client struct {
 	http  *http.Client
 }
 
-// New checks the base URL: only credential-free HTTPS origins under weixin.qq.com are accepted.
+// New checks the base URL: only credential-free HTTPS origins under weixin.qq.com or wechat.com are accepted.
 func New(o Options) (*Client, error) {
 	if o.BaseURL == "" {
 		o.BaseURL = AuthOrigin
@@ -74,12 +74,24 @@ func New(o Options) (*Client, error) {
 	return &Client{base: base, token: strings.TrimSpace(o.Token), agent: sanitizeAgent(o.Agent), http: &hc}, nil
 }
 
-// ValidateBaseURL accepts https://<weixin.qq.com or a subdomain>[:443]/ and nothing else.
+const (
+	diagMaxScheme = 16
+	diagMaxHost   = 128
+	diagMaxPort   = 16
+	diagMaxPath   = 64
+)
+
+// ValidateBaseURL accepts https://<weixin.qq.com, wechat.com, or a subdomain>[:443]/ and nothing else.
 func ValidateBaseURL(raw string) (*url.URL, error) {
+	return validateBaseURL("", raw)
+}
+
+func validateBaseURL(source, raw string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Scheme != "https" || u.User != nil || (u.Port() != "" && u.Port() != "443") ||
-		u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || !tencentHost(u.Hostname()) {
-		return nil, &Error{Code: CodeProtocol, Msg: "iLink base URL must be a Tencent HTTPS origin"}
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" ||
+		(u.Path != "" && u.Path != "/") || !tencentHost(u.Hostname()) {
+		return nil, &Error{Code: CodeProtocol, Msg: invalidBaseURLMessage(source, u, err)}
 	}
 	u.Path = "/"
 	return u, nil
@@ -87,7 +99,89 @@ func ValidateBaseURL(raw string) (*url.URL, error) {
 
 func tencentHost(h string) bool {
 	h = strings.ToLower(h)
-	return h == "weixin.qq.com" || strings.HasSuffix(h, ".weixin.qq.com")
+	return matchesDomain(h, "weixin.qq.com") || matchesDomain(h, "wechat.com")
+}
+
+func matchesDomain(h, domain string) bool {
+	if h == domain {
+		return true
+	}
+	if !strings.HasSuffix(h, "."+domain) {
+		return false
+	}
+	prefix := h[:len(h)-len(domain)-1]
+	if prefix == "" {
+		return false
+	}
+	for _, label := range strings.Split(prefix, ".") {
+		if label == "" || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func invalidBaseURLMessage(source string, u *url.URL, parseErr error) string {
+	return "iLink base URL must be a Tencent HTTPS origin (" + formatURLDiag(source, u, parseErr, true) + ")"
+}
+
+// formatURLDiag summarizes a rejected URL using only sanitized scheme/host/port (and path when includePath is true).
+// It never includes raw input on parse failure, nor userinfo, query, fragment, or opaque values.
+func formatURLDiag(source string, u *url.URL, parseErr error, includePath bool) string {
+	var parts []string
+	if source != "" {
+		parts = append(parts, "source="+source)
+	}
+	if parseErr != nil || u == nil {
+		parts = append(parts, "unparseable")
+		return strings.Join(parts, " ")
+	}
+	parts = append(parts,
+		`scheme="`+sanitizeDiagPart(u.Scheme, diagMaxScheme)+`"`,
+		`host="`+sanitizeDiagPart(u.Hostname(), diagMaxHost)+`"`,
+		`port="`+sanitizeDiagPart(u.Port(), diagMaxPort)+`"`,
+	)
+	if includePath {
+		parts = append(parts, `path="`+sanitizeDiagPart(u.EscapedPath(), diagMaxPath)+`"`)
+	}
+	if u.User != nil {
+		parts = append(parts, "userinfo=redacted")
+	}
+	if includePath {
+		if u.RawQuery != "" || u.ForceQuery {
+			parts = append(parts, "query=redacted")
+		}
+		if u.Fragment != "" || u.RawFragment != "" {
+			parts = append(parts, "fragment=redacted")
+		}
+	}
+	if u.Opaque != "" {
+		parts = append(parts, "opaque=redacted")
+	}
+	return strings.Join(parts, " ")
+}
+
+func sanitizeDiagPart(s string, maxLen int) string {
+	var b strings.Builder
+	b.Grow(min(len(s), maxLen))
+	for _, r := range s {
+		if b.Len() >= maxLen {
+			b.WriteString("...")
+			break
+		}
+		if r < 0x21 || r >= 0x7f || r == '"' || r == '\\' {
+			b.WriteByte('?')
+		} else {
+			b.WriteByte(byte(r))
+		}
+	}
+	return b.String()
 }
 
 // sanitizeAgent keeps the product/version tokens of a User-Agent-like string, at most 256 bytes.

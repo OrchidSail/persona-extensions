@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -37,7 +38,7 @@ func (c *Client) BeginQR(ctx context.Context, localTokens []string) (QR, error) 
 	}
 	u, err := url.Parse(q.Content)
 	if err != nil || u.Scheme != "https" || u.User != nil || !tencentHost(u.Hostname()) {
-		return QR{}, &Error{Code: CodeBadResponse, Msg: "iLink answered an invalid QR code", Retry: true}
+		return QR{}, &Error{Code: CodeBadResponse, Msg: "iLink answered an invalid QR code (" + formatURLDiag("qrcode_img_content", u, err, false) + ")", Retry: true}
 	}
 	return q, nil
 }
@@ -82,7 +83,7 @@ func (c *Client) PollQR(ctx context.Context, code, verifyCode, base string, wait
 	if base == "" {
 		base = AuthOrigin
 	}
-	b, err := ValidateBaseURL(base)
+	b, err := validateBaseURL("base", base)
 	if err != nil {
 		return QRStatus{}, err
 	}
@@ -107,9 +108,9 @@ func (c *Client) PollQR(ctx context.Context, code, verifyCode, base string, wait
 	case QRRedirect:
 		h := str(out, "redirect_host")
 		if !redirectHost.MatchString(h) {
-			return QRStatus{}, &Error{Code: CodeBadResponse, Msg: "iLink answered an invalid redirect", Retry: true}
+			return QRStatus{}, &Error{Code: CodeBadResponse, Msg: invalidRedirectHostMessage(h), Retry: true}
 		}
-		r, err := ValidateBaseURL("https://" + h)
+		r, err := validateBaseURL("redirect_host", "https://"+h)
 		if err != nil {
 			return QRStatus{}, err
 		}
@@ -119,7 +120,7 @@ func (c *Client) PollQR(ctx context.Context, code, verifyCode, base string, wait
 		if cr.Token == "" || cr.BotID == "" || cr.UserID == "" || cr.BaseURL == "" {
 			return QRStatus{}, &Error{Code: CodeBadResponse, Msg: "iLink confirmed without credentials", Retry: true}
 		}
-		u, err := ValidateBaseURL(cr.BaseURL)
+		u, err := validateBaseURL("baseurl", cr.BaseURL)
 		if err != nil {
 			return QRStatus{}, err
 		}
@@ -129,4 +130,20 @@ func (c *Client) PollQR(ctx context.Context, code, verifyCode, base string, wait
 		return QRStatus{}, &Error{Code: CodeBadResponse, Msg: "iLink answered an unknown authorization status", Retry: true}
 	}
 	return st, nil
+}
+
+func invalidRedirectHostMessage(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "iLink answered an invalid redirect (source=redirect_host empty)"
+	}
+	if strings.Contains(trimmed, "://") {
+		u, err := url.Parse(trimmed)
+		return "iLink answered an invalid redirect (" + formatURLDiag("redirect_host", u, err, true) + ")"
+	}
+	u, err := url.Parse("https://" + trimmed)
+	if err == nil {
+		u.Scheme = "" // redirect_host carried no scheme; do not report the synthetic one
+	}
+	return "iLink answered an invalid redirect (" + formatURLDiag("redirect_host", u, err, true) + ")"
 }

@@ -64,17 +64,79 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func TestValidateBaseURL(t *testing.T) {
-	for _, ok := range []string{"https://ilinkai.weixin.qq.com", "https://ilinkai.weixin.qq.com/", "https://weixin.qq.com:443"} {
+	for _, ok := range []string{
+		"https://ilinkai.weixin.qq.com",
+		"https://ilinkai.weixin.qq.com/",
+		"https://weixin.qq.com:443",
+		"https://ilinkai.wechat.com",
+		"https://ilinkai.wechat.com/",
+		"https://sg.ilinkai.wechat.com/",
+		"https://wechat.com",
+		"https://wechat.com:443",
+		"https://ILINKAI.WECHAT.COM/",
+	} {
 		if _, err := ValidateBaseURL(ok); err != nil {
 			t.Errorf("%s: %v", ok, err)
 		}
 	}
-	for _, bad := range []string{"http://ilinkai.weixin.qq.com", "https://evil.com", "https://weixin.qq.com.evil.com",
-		"https://u:p@ilinkai.weixin.qq.com", "https://ilinkai.weixin.qq.com:8443", "https://ilinkai.weixin.qq.com/x",
-		"https://ilinkai.weixin.qq.com/?a=1", "https://evilweixin.qq.com"} {
+	for _, bad := range []string{
+		"http://ilinkai.weixin.qq.com",
+		"http://ilinkai.wechat.com",
+		"https://evil.com",
+		"https://weixin.qq.com.evil.com",
+		"https://wechat.com.evil.com",
+		"https://evilweixin.qq.com",
+		"https://evilwechat.com",
+		"https://.weixin.qq.com",
+		"https://.wechat.com",
+		"https://a..wechat.com",
+		"https://-bad.wechat.com",
+		"https://ilinkai.wechat.com.",
+		"https://u:p@ilinkai.weixin.qq.com",
+		"https://u:p@ilinkai.wechat.com",
+		"https://ilinkai.weixin.qq.com:8443",
+		"https://ilinkai.wechat.com:8443",
+		"https://ilinkai.weixin.qq.com/x",
+		"https://ilinkai.wechat.com/x",
+		"https://ilinkai.weixin.qq.com/?a=1",
+		"https://ilinkai.wechat.com/?a=1",
+		"https://ilinkai.wechat.com/?",
+		"https://ilinkai.wechat.com/#frag",
+		"ilinkai.wechat.com",
+		"://bad?token=secret",
+	} {
 		if _, err := ValidateBaseURL(bad); err == nil {
 			t.Errorf("%s accepted", bad)
 		}
+	}
+}
+
+func TestValidateBaseURLDiagnostics(t *testing.T) {
+	_, err := ValidateBaseURL("https://user:supersecret@ilinkai.wechat.com:8443/prefix?bot_token=BOT_SECRET&qrcode=QR_SECRET&user=OWNER_ID#FRAG_SECRET")
+	if err == nil || CodeOf(err) != CodeProtocol {
+		t.Fatalf("expected protocol error, got %v", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{`scheme="https"`, `host="ilinkai.wechat.com"`, `port="8443"`, `path="/prefix"`, "userinfo=redacted", "query=redacted", "fragment=redacted"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("missing %q in %q", want, msg)
+		}
+	}
+	for _, forbidden := range []string{"user:", "supersecret", "bot_token", "BOT_SECRET", "qrcode", "QR_SECRET", "OWNER_ID", "FRAG_SECRET"} {
+		if strings.Contains(msg, forbidden) {
+			t.Errorf("leaked %q in %q", forbidden, msg)
+		}
+	}
+
+	_, err = ValidateBaseURL("://bad?bot_token=UNPARSEABLE_SECRET")
+	if err == nil || !strings.Contains(err.Error(), "unparseable") || strings.Contains(err.Error(), "UNPARSEABLE_SECRET") {
+		t.Fatalf("unexpected unparseable diagnostic: %v", err)
+	}
+
+	longPath := "/" + strings.Repeat("a", 100)
+	_, err = ValidateBaseURL("https://ilinkai.wechat.com" + longPath)
+	if err == nil || !strings.Contains(err.Error(), `path="/`+strings.Repeat("a", diagMaxPath-1)+`..."`) {
+		t.Fatalf("expected truncated path diagnostic, got %v", err)
 	}
 }
 
@@ -139,20 +201,115 @@ func TestQRAuthorization(t *testing.T) {
 	}
 }
 
-func TestQRRejectsForeignContentAndRedirect(t *testing.T) {
+func TestQRAuthorizationInternationalWeChat(t *testing.T) {
+	polls := 0
 	f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
-		if r.URL.Path == "/ilink/bot/get_bot_qrcode" {
-			writeJSON(w, map[string]any{"qrcode": "QC", "qrcode_img_content": "https://evil.example/q"})
-			return
+		switch r.URL.Path {
+		case "/ilink/bot/get_bot_qrcode":
+			writeJSON(w, map[string]any{"qrcode": "QC-INTL", "qrcode_img_content": "https://liteapp.wechat.com/q/intl"})
+		case "/ilink/bot/get_qrcode_status":
+			polls++
+			switch polls {
+			case 1:
+				writeJSON(w, map[string]any{"status": "scaned_but_redirect", "redirect_host": "ilinkai.wechat.com"})
+			case 2:
+				writeJSON(w, map[string]any{
+					"status":        "confirmed",
+					"bot_token":     "BT-INTL",
+					"ilink_bot_id":  "bot@im",
+					"ilink_user_id": "owner@im",
+					"baseurl":       "https://ilinkai.wechat.com/",
+				})
+			}
+		case "/ilink/bot/getupdates":
+			writeJSON(w, map[string]any{"ret": 0, "get_updates_buf": "C1", "msgs": []any{}})
+		default:
+			t.Errorf("unexpected %s", r.URL)
 		}
-		writeJSON(w, map[string]any{"status": "scaned_but_redirect", "redirect_host": "evil.example"})
 	})
 	c := f.client("", "")
-	if _, err := c.BeginQR(context.Background(), nil); CodeOf(err) != CodeBadResponse {
+	q, err := c.BeginQR(context.Background(), nil)
+	if err != nil || q.Code != "QC-INTL" || q.Content != "https://liteapp.wechat.com/q/intl" {
+		t.Fatalf("begin %+v %v", q, err)
+	}
+	st, err := c.PollQR(context.Background(), q.Code, "", "", time.Second)
+	if err != nil || st.State != QRRedirect || st.RedirectBase != "https://ilinkai.wechat.com/" {
+		t.Fatalf("redirect %+v %v", st, err)
+	}
+	st, err = c.PollQR(context.Background(), q.Code, "", st.RedirectBase, time.Second)
+	want := Credentials{Token: "BT-INTL", BotID: "bot@im", UserID: "owner@im", BaseURL: "https://ilinkai.wechat.com/"}
+	if err != nil || st.State != QRConfirmed || st.Credentials != want {
+		t.Fatalf("confirmed %+v %v", st, err)
+	}
+	intlClient := f.client(st.Credentials.Token, st.Credentials.BaseURL)
+	if _, err := intlClient.GetUpdates(context.Background(), ""); err != nil {
+		t.Fatalf("getupdates on international base URL: %v", err)
+	}
+	if len(f.hosts) != 4 || f.hosts[0] != "ilinkai.weixin.qq.com" || f.hosts[1] != "ilinkai.weixin.qq.com" ||
+		f.hosts[2] != "ilinkai.wechat.com" || f.hosts[3] != "ilinkai.wechat.com" {
+		t.Errorf("hosts %v", f.hosts)
+	}
+}
+
+func TestQRRejectsForeignContentAndRedirect(t *testing.T) {
+	pollStep := 0
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
+		if r.URL.Path == "/ilink/bot/get_bot_qrcode" {
+			writeJSON(w, map[string]any{"qrcode": "QC", "qrcode_img_content": "https://evil.example/q/QR_SECRET_VALUE?k=v"})
+			return
+		}
+		pollStep++
+		switch pollStep {
+		case 1:
+			writeJSON(w, map[string]any{"status": "scaned_but_redirect", "redirect_host": "evil.example"})
+		case 2:
+			writeJSON(w, map[string]any{"status": "scaned_but_redirect", "redirect_host": "https://ilinkai.wechat.com:8443/p?token=REDIR_SECRET"})
+		case 3:
+			writeJSON(w, map[string]any{
+				"status":        "confirmed",
+				"bot_token":     "BOT_TOKEN_SECRET",
+				"ilink_bot_id":  "bot@im",
+				"ilink_user_id": "OWNER_USER_SECRET@im",
+				"baseurl":       "https://u:pass@evilwechat.com:8443/v1?token=QUERY_SECRET#FRAG_SECRET",
+			})
+		}
+	})
+	c := f.client("", "")
+	if _, err := c.BeginQR(context.Background(), nil); CodeOf(err) != CodeBadResponse ||
+		!strings.Contains(err.Error(), "source=qrcode_img_content") ||
+		!strings.Contains(err.Error(), `host="evil.example"`) ||
+		strings.Contains(err.Error(), "QR_SECRET_VALUE") ||
+		strings.Contains(err.Error(), "k=v") {
 		t.Errorf("foreign QR content: %v", err)
 	}
-	if _, err := c.PollQR(context.Background(), "QC", "", "", time.Second); CodeOf(err) != CodeProtocol {
+	if _, err := c.PollQR(context.Background(), "QC", "", "", time.Second); CodeOf(err) != CodeProtocol ||
+		!strings.Contains(err.Error(), "source=redirect_host") ||
+		!strings.Contains(err.Error(), `host="evil.example"`) {
 		t.Errorf("foreign redirect: %v", err)
+	}
+	if _, err := c.PollQR(context.Background(), "QC", "", "", time.Second); CodeOf(err) != CodeBadResponse ||
+		!strings.Contains(err.Error(), "source=redirect_host") ||
+		!strings.Contains(err.Error(), `port="8443"`) ||
+		!strings.Contains(err.Error(), `path="/p"`) ||
+		!strings.Contains(err.Error(), "query=redacted") ||
+		strings.Contains(err.Error(), "REDIR_SECRET") {
+		t.Errorf("malformed redirect: %v", err)
+	}
+	if _, err := c.PollQR(context.Background(), "QC", "", "", time.Second); CodeOf(err) != CodeProtocol ||
+		!strings.Contains(err.Error(), "source=baseurl") ||
+		!strings.Contains(err.Error(), `scheme="https"`) ||
+		!strings.Contains(err.Error(), `host="evilwechat.com"`) ||
+		!strings.Contains(err.Error(), `port="8443"`) ||
+		!strings.Contains(err.Error(), `path="/v1"`) ||
+		!strings.Contains(err.Error(), "userinfo=redacted") ||
+		!strings.Contains(err.Error(), "query=redacted") ||
+		!strings.Contains(err.Error(), "fragment=redacted") ||
+		strings.Contains(err.Error(), "BOT_TOKEN_SECRET") ||
+		strings.Contains(err.Error(), "OWNER_USER_SECRET") ||
+		strings.Contains(err.Error(), "QUERY_SECRET") ||
+		strings.Contains(err.Error(), "FRAG_SECRET") ||
+		strings.Contains(err.Error(), "pass") {
+		t.Errorf("foreign confirmed baseurl: %v", err)
 	}
 }
 
@@ -288,17 +445,33 @@ func TestDownload(t *testing.T) {
 		{Query: "Q", KeyHex: hex.EncodeToString(key)},
 		{Query: "Q", KeyB64: base64.StdEncoding.EncodeToString(key)},
 		{Query: "Q", KeyB64: base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(key)))},
+		{URL: "https://novac2c.cdn.wechat.com/c2c/download?encrypted_query_param=Q", KeyHex: hex.EncodeToString(key)},
+		{URL: "https://wechat.com/c2c/download?encrypted_query_param=Q", KeyHex: hex.EncodeToString(key)},
 	} {
 		got, err := c.Download(context.Background(), m)
 		if err != nil || !bytes.Equal(got, plain) {
 			t.Errorf("%+v: %q %v", m, got, err)
 		}
 	}
-	if f.hosts[0] != "novac2c.cdn.weixin.qq.com" {
+	if f.hosts[0] != "novac2c.cdn.weixin.qq.com" || f.hosts[3] != "novac2c.cdn.wechat.com" || f.hosts[4] != "wechat.com" {
 		t.Errorf("host %v", f.hosts)
 	}
-	if _, err := c.Download(context.Background(), Media{URL: "https://evil.example/x", KeyHex: hex.EncodeToString(key)}); CodeOf(err) != CodeProtocol {
-		t.Errorf("foreign URL: %v", err)
+	for _, bad := range []string{
+		"https://evil.example/x",
+		"https://evilwechat.com/c2c/download?encrypted_query_param=MEDIA_SECRET",
+		"https://wechat.com.evil.com/x",
+		"http://novac2c.cdn.wechat.com/x",
+		"https://novac2c.cdn.wechat.com:8443/x",
+		"https://u:media_pass@novac2c.cdn.wechat.com/secret_path?encrypted_query_param=MEDIA_SECRET",
+	} {
+		_, err := c.Download(context.Background(), Media{URL: bad, KeyHex: hex.EncodeToString(key)})
+		if CodeOf(err) != CodeProtocol {
+			t.Errorf("bad media URL %s: %v", bad, err)
+			continue
+		}
+		if strings.Contains(err.Error(), "MEDIA_SECRET") || strings.Contains(err.Error(), "media_pass") || strings.Contains(err.Error(), "secret_path") {
+			t.Errorf("media URL diagnostic leaked secret for %s: %v", bad, err)
+		}
 	}
 	if _, err := DecryptECB(enc[:16], key); err == nil {
 		t.Error("bad padding accepted")
