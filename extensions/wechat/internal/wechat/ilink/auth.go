@@ -2,7 +2,6 @@ package ilink
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -94,10 +93,10 @@ func (c *Client) PollQR(ctx context.Context, code, verifyCode, base string, wait
 	if verifyCode != "" {
 		q.Set("verify_code", verifyCode)
 	}
+	start := c.clock()
 	out, err := c.call(ctx, http.MethodGet, "ilink/bot/get_qrcode_status?"+q.Encode(), nil, false, wait, b)
 	if err != nil {
-		var e *Error
-		if errors.As(err, &e) && e.Code == CodeTimeout {
+		if c.isLongPollTimeout(err, c.clock().Sub(start)) {
 			return QRStatus{State: QRWaiting}, nil
 		}
 		return QRStatus{}, err

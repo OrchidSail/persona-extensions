@@ -403,6 +403,50 @@ func TestGetUpdatesTimeoutKeepsCursor(t *testing.T) {
 	}
 }
 
+func TestLongPollEdge524(t *testing.T) {
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
+		w.WriteHeader(edgePollTimeoutStatus)
+	})
+
+	// Sustained HTTP 524 during GetUpdates (e.g. Tencent EdgeOne ~30s origin timeout on ilinkai.wechat.com)
+	// is treated as a normal empty poll and preserves the cursor.
+	c := f.client("BT", "https://ilinkai.wechat.com/")
+	cur := time.Date(2026, 11, 21, 0, 0, 0, 0, time.UTC)
+	step := 0
+	c.now = func() time.Time {
+		step++
+		if step%2 == 0 {
+			return cur.Add(30 * time.Second)
+		}
+		return cur
+	}
+	p, err := c.GetUpdates(context.Background(), "C-keep")
+	if err != nil {
+		t.Fatalf("sustained 524 on GetUpdates should be empty poll, got err: %v", err)
+	}
+	if p.Cursor != "C-keep" || len(p.Messages) != 0 {
+		t.Fatalf("unexpected poll on sustained 524: %+v", p)
+	}
+
+	// Sustained HTTP 524 during PollQR is treated as QRWaiting.
+	st, err := c.PollQR(context.Background(), "QC", "", "https://ilinkai.wechat.com/", longPollTimeout)
+	if err != nil || st.State != QRWaiting {
+		t.Fatalf("sustained 524 on PollQR should be QRWaiting, got %+v %v", st, err)
+	}
+
+	// Fast HTTP 524 during GetUpdates still returns a retryable CodeHTTP error (avoiding a hot retry loop).
+	fast := f.client("BT", "https://ilinkai.wechat.com/")
+	fast.now = func() time.Time { return cur }
+	if _, err := fast.GetUpdates(context.Background(), "C-keep"); CodeOf(err) != CodeHTTP || !Retryable(err) {
+		t.Fatalf("fast 524 on GetUpdates should be retryable HTTP error, got %v", err)
+	}
+
+	// HTTP 524 on non-poll endpoints (such as SendText) still returns a retryable CodeHTTP error even if slow.
+	if err := c.SendText(context.Background(), "owner@im", "CT", "cid", "hi"); CodeOf(err) != CodeHTTP || !Retryable(err) {
+		t.Fatalf("524 on SendText should be retryable HTTP error, got %v", err)
+	}
+}
+
 func TestSendTextAndTyping(t *testing.T) {
 	var got []map[string]any
 	f := newFake(t, func(w http.ResponseWriter, r *http.Request, body map[string]any) {

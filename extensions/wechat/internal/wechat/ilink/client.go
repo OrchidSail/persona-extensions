@@ -30,6 +30,11 @@ const ClientVersion = "2.4.6"
 const (
 	apiTimeout      = 15 * time.Second
 	longPollTimeout = 35 * time.Second
+	// edgePollTimeoutStatus is the HTTP status edge proxies (such as Tencent EdgeOne on ilinkai.wechat.com)
+	// return when an idle long poll hits the edge's origin read timeout before longPollTimeout.
+	edgePollTimeoutStatus = 524
+	// minEdgePollWait avoids treating a fast HTTP 524 failure as a normal idle poll timeout (and prevents hot loops).
+	minEdgePollWait = 10 * time.Second
 	maxResponse     = 4 << 20
 	maxPollMessages = 100
 	maxItems        = 20
@@ -49,10 +54,12 @@ type Options struct {
 
 // Client calls iLink. It is safe for concurrent use.
 type Client struct {
-	base  *url.URL
-	token string
-	agent string
-	http  *http.Client
+	base            *url.URL
+	token           string
+	agent           string
+	http            *http.Client
+	now             func() time.Time
+	minEdgePollWait time.Duration
 }
 
 // New checks the base URL: only credential-free HTTPS origins under weixin.qq.com or wechat.com are accepted.
@@ -301,7 +308,12 @@ func (c *Client) call(ctx context.Context, method, path string, body any, authed
 		return nil, &Error{Code: CodeBadResponse, Msg: "iLink answer too large", Retry: true}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, &Error{Code: CodeHTTP, Msg: fmt.Sprintf("iLink answered HTTP %d", resp.StatusCode), Retry: resp.StatusCode >= 500 || resp.StatusCode == 429}
+		return nil, &Error{
+			Code:   CodeHTTP,
+			Msg:    fmt.Sprintf("iLink answered HTTP %d", resp.StatusCode),
+			Retry:  resp.StatusCode >= 500 || resp.StatusCode == 429,
+			status: resp.StatusCode,
+		}
 	}
 	var out map[string]any
 	if err := json.Unmarshal(data, &out); err != nil || out == nil {
@@ -355,15 +367,37 @@ type Poll struct {
 	Timeout time.Duration
 }
 
+func (c *Client) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *Client) isLongPollTimeout(err error, elapsed time.Duration) bool {
+	var e *Error
+	if !errors.As(err, &e) {
+		return false
+	}
+	if e.Code == CodeTimeout {
+		return true
+	}
+	minWait := c.minEdgePollWait
+	if minWait <= 0 {
+		minWait = minEdgePollWait
+	}
+	return e.Code == CodeHTTP && e.status == edgePollTimeoutStatus && elapsed >= minWait
+}
+
 // GetUpdates long-polls for new messages after cursor ("" the first time). A long poll that ends without anything
 // is not an error: it answers the same cursor and no messages. errcode -14 (another client took the token) is
 // CodeReplaced.
 func (c *Client) GetUpdates(ctx context.Context, cursor string) (Poll, error) {
+	start := c.clock()
 	out, err := c.call(ctx, http.MethodPost, "ilink/bot/getupdates",
 		map[string]any{"get_updates_buf": cursor, "base_info": c.baseInfo()}, true, longPollTimeout, nil)
 	if err != nil {
-		var e *Error
-		if errors.As(err, &e) && e.Code == CodeTimeout {
+		if c.isLongPollTimeout(err, c.clock().Sub(start)) {
 			return Poll{Cursor: cursor}, nil
 		}
 		return Poll{}, err
