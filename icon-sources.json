@@ -33,6 +33,14 @@
       "license_file": "assets/LICENSE",
       "attribution": "LINUX DO. Official icon asset, with the upstream repository license notice preserved in each package. Trademark rights are separate from copyright licensing."
     },
+    "mika": {
+      "repository": "https://github.com/wangzan101/Mika",
+      "revision": "ecac3ac7e1f8113600054dd700fde41ed2fe0960",
+      "license": "Apache-2.0",
+      "license_url": "https://raw.githubusercontent.com/wangzan101/Mika/ecac3ac7e1f8113600054dd700fde41ed2fe0960/LICENSE",
+      "license_file": "assets/LICENSE",
+      "attribution": "Mika project (wangzan101/Mika). Official app icon asset, with the upstream Apache-2.0 license notice preserved in each package. Trademark rights are separate from copyright licensing."
+    },
     "mnemo": {
       "repository": "https://github.com/szupzj18/mnemo",
       "revision": "d4da6e2b0ce5f0580a01b5f9c61dada75d19b16d",
@@ -653,6 +661,17 @@
       "height": 512,
       "trademark_owner": "Memos project",
       "usage": "Exact Raycast extension icon used to identify the corresponding public service."
+    },
+    "mika": {
+      "path": "assets/icon.png",
+      "source_id": "mika",
+      "source_url": "https://raw.githubusercontent.com/wangzan101/Mika/ecac3ac7e1f8113600054dd700fde41ed2fe0960/docs/media/logo.png",
+      "sha256": "e317f8341c6a6f25418c8f8653623813fd22bb9a38f740e26654934a56e857b0",
+      "format": "png",
+      "width": 512,
+      "height": 512,
+      "trademark_owner": "Mika project",
+      "usage": "Official Mika app icon identifying the Mika Android phone agent extension."
     },
     "miniflux": {
       "path": "assets/icon.png",
