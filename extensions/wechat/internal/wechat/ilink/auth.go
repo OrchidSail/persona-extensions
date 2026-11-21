@@ -138,11 +138,11 @@ func invalidRedirectHostMessage(raw string) string {
 	}
 	if strings.Contains(trimmed, "://") {
 		u, err := url.Parse(trimmed)
-		return "iLink answered an invalid redirect (" + formatURLDiag("redirect_host", u, err, true) + ")"
+		return "iLink answered an invalid redirect (" + formatURLDiag("redirect_host", u, err, false) + ")"
 	}
 	u, err := url.Parse("https://" + trimmed)
 	if err == nil {
 		u.Scheme = "" // redirect_host carried no scheme; do not report the synthetic one
 	}
-	return "iLink answered an invalid redirect (" + formatURLDiag("redirect_host", u, err, true) + ")"
+	return "iLink answered an invalid redirect (" + formatURLDiag("redirect_host", u, err, false) + ")"
 }

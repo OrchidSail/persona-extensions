@@ -274,6 +274,10 @@ func TestQRRejectsForeignContentAndRedirect(t *testing.T) {
 		case 2:
 			writeJSON(w, map[string]any{"status": "scaned_but_redirect", "redirect_host": "https://ilinkai.wechat.com:8443/p?token=REDIR_SECRET"})
 		case 3:
+			writeJSON(w, map[string]any{"status": "scaned_but_redirect", "redirect_host": "https://evil.example/p/REDIR_SECRET"})
+		case 4:
+			writeJSON(w, map[string]any{"status": "scaned_but_redirect", "redirect_host": "evil.example/p/REDIR_SECRET?token=SECRET_Q"})
+		case 5:
 			writeJSON(w, map[string]any{
 				"status":        "confirmed",
 				"bot_token":     "BOT_TOKEN_SECRET",
@@ -305,11 +309,33 @@ func TestQRRejectsForeignContentAndRedirect(t *testing.T) {
 	}
 	if _, err := c.PollQR(context.Background(), "QC", "", "", time.Second); CodeOf(err) != CodeBadResponse ||
 		!strings.Contains(err.Error(), "source=redirect_host") ||
+		!strings.Contains(err.Error(), `scheme="https"`) ||
+		!strings.Contains(err.Error(), `host="ilinkai.wechat.com"`) ||
 		!strings.Contains(err.Error(), `port="8443"`) ||
-		!strings.Contains(err.Error(), `path="/p"`) ||
-		!strings.Contains(err.Error(), "query=redacted") ||
+		strings.Contains(err.Error(), "path=") ||
+		strings.Contains(err.Error(), "/p") ||
 		strings.Contains(err.Error(), "REDIR_SECRET") {
 		t.Errorf("malformed redirect: %v", err)
+	}
+	if _, err := c.PollQR(context.Background(), "QC", "", "", time.Second); CodeOf(err) != CodeBadResponse ||
+		!strings.Contains(err.Error(), "source=redirect_host") ||
+		!strings.Contains(err.Error(), `scheme="https"`) ||
+		!strings.Contains(err.Error(), `host="evil.example"`) ||
+		strings.Contains(err.Error(), "path=") ||
+		strings.Contains(err.Error(), "/p") ||
+		strings.Contains(err.Error(), "REDIR_SECRET") {
+		t.Errorf("malformed redirect with path secret: %v", err)
+	}
+	if _, err := c.PollQR(context.Background(), "QC", "", "", time.Second); CodeOf(err) != CodeBadResponse ||
+		!strings.Contains(err.Error(), "source=redirect_host") ||
+		!strings.Contains(err.Error(), `scheme=""`) ||
+		!strings.Contains(err.Error(), `host="evil.example"`) ||
+		strings.Contains(err.Error(), "path=") ||
+		strings.Contains(err.Error(), "/p") ||
+		strings.Contains(err.Error(), "REDIR_SECRET") ||
+		strings.Contains(err.Error(), "SECRET_Q") ||
+		strings.Contains(err.Error(), "token=") {
+		t.Errorf("schemeless redirect with path/query secret: %v", err)
 	}
 	if _, err := c.PollQR(context.Background(), "QC", "", "", time.Second); CodeOf(err) != CodeProtocol ||
 		!strings.Contains(err.Error(), "source=baseurl") ||
