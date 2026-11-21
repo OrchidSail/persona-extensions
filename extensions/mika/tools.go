@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,30 +24,52 @@ var taskIDSchema = map[string]any{
 	"maxLength": 128,
 }
 
+var deviceSchema = map[string]any{
+	"type":        "string",
+	"minLength":   1,
+	"maxLength":   maxDeviceSel,
+	"description": "Optional target phone name (case-insensitive, e.g. A16, S25+) or slot alias (primary/secondary/tertiary or 1/2/3). Omit to use the primary device (slot 1).",
+}
+
 var readTools = []tool{
 	{
-		Name:        "mika_doctor",
-		Description: "Check Mika server reachability, API/server versions, capabilities, limits and phone helper readiness (read-only; does not invoke the model or start a task).",
+		Name:        "mika_list_devices",
+		Description: "List all configured Mika Android devices with their slot, custom name, masked URL, configuration status and last known health (read-only).",
 		InputSchema: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{},
+		},
+	},
+	{
+		Name:        "mika_doctor",
+		Description: "Check Mika server reachability, API/server versions, capabilities, limits and phone helper readiness (read-only; does not invoke the model or start a task). When device is omitted and multiple devices are configured, summarizes all configured devices; pass device to check one specific device.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"device": deviceSchema,
+			},
 		},
 	},
 	{
 		Name:        "mika_device_state",
 		Description: "Read phone screen, lock screen, helper availability and remote-unlock toggle state via Mika GET /api/v1/device (read-only; never wakes or unlocks the phone or returns credentials).",
 		InputSchema: map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
+			"type": "object",
+			"properties": map[string]any{
+				"device": deviceSchema,
+			},
 		},
 	},
 	{
 		Name:        "mika_task_status",
 		Description: "Read the current status, step, progress, open question, phone takeover notice, steers, output files and final answer of a remote Mika task.",
 		InputSchema: map[string]any{
-			"type":       "object",
-			"required":   []string{"task_id"},
-			"properties": map[string]any{"task_id": taskIDSchema},
+			"type":     "object",
+			"required": []string{"task_id"},
+			"properties": map[string]any{
+				"task_id": taskIDSchema,
+				"device":  deviceSchema,
+			},
 		},
 	},
 	{
@@ -58,6 +81,7 @@ var readTools = []tool{
 			"properties": map[string]any{
 				"task_id":   taskIDSchema,
 				"timeout_s": map[string]any{"type": "integer", "minimum": minWaitSeconds, "maximum": maxWaitSeconds},
+				"device":    deviceSchema,
 			},
 		},
 	},
@@ -69,6 +93,7 @@ var readTools = []tool{
 			"properties": map[string]any{
 				"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": maxListLimit},
 				"before": map[string]any{"type": "string", "minLength": 1, "maxLength": 256},
+				"device": deviceSchema,
 			},
 		},
 	},
@@ -81,6 +106,7 @@ var readTools = []tool{
 			"properties": map[string]any{
 				"task_id":    taskIDSchema,
 				"max_events": map[string]any{"type": "integer", "minimum": 1, "maximum": 200},
+				"device":     deviceSchema,
 			},
 		},
 	},
@@ -89,7 +115,7 @@ var readTools = []tool{
 var actionTools = []tool{
 	{
 		Name:        "mika_run_task",
-		Description: "Start a remote task on the Android phone through Mika after explicit confirmation. Payments, logins and takeover confirmations always stay on the phone.",
+		Description: "Start a remote task on the target Android phone through Mika after explicit confirmation. Payments, logins and takeover confirmations always stay on the phone.",
 		InputSchema: map[string]any{
 			"type":     "object",
 			"required": []string{"goal"},
@@ -97,6 +123,7 @@ var actionTools = []tool{
 				"goal":            map[string]any{"type": "string", "minLength": 1, "maxLength": maxGoalChars},
 				"conversation_id": map[string]any{"type": "string", "minLength": 1, "maxLength": 128},
 				"request_id":      map[string]any{"type": "string", "minLength": 36, "maxLength": 36},
+				"device":          deviceSchema,
 			},
 		},
 	},
@@ -109,6 +136,7 @@ var actionTools = []tool{
 			"properties": map[string]any{
 				"task_id": taskIDSchema,
 				"text":    map[string]any{"type": "string", "minLength": 1, "maxLength": maxAnswerChars},
+				"device":  deviceSchema,
 			},
 		},
 	},
@@ -121,6 +149,7 @@ var actionTools = []tool{
 			"properties": map[string]any{
 				"task_id": taskIDSchema,
 				"text":    map[string]any{"type": "string", "minLength": 1, "maxLength": maxSteerChars},
+				"device":  deviceSchema,
 			},
 		},
 	},
@@ -128,9 +157,12 @@ var actionTools = []tool{
 		Name:        "mika_cancel_task",
 		Description: "Request cancellation of an active remote Mika task after explicit confirmation. Confirm completion by polling mika_task_status until cancelled.",
 		InputSchema: map[string]any{
-			"type":       "object",
-			"required":   []string{"task_id"},
-			"properties": map[string]any{"task_id": taskIDSchema},
+			"type":     "object",
+			"required": []string{"task_id"},
+			"properties": map[string]any{
+				"task_id": taskIDSchema,
+				"device":  deviceSchema,
+			},
 		},
 	},
 }
@@ -150,101 +182,177 @@ func decode(raw json.RawMessage, out any) error {
 	return nil
 }
 
+type doctorProbeResult struct {
+	entry  deviceEntry
+	info   discoveryInfo
+	dev    *deviceResponse
+	devErr error
+	err    error
+}
+
+func (a *app) probeDeviceDoctor(ctx context.Context, d deviceEntry) doctorProbeResult {
+	res := doctorProbeResult{entry: d}
+	if !d.ready() {
+		return res
+	}
+	info, err := d.client.discover(ctx)
+	a.recordDevice(d.slot, err)
+	if err != nil {
+		res.err = err
+		return res
+	}
+	res.info = info
+	if slices.Contains(info.Capabilities, "device_state") {
+		if dev, derr := d.client.deviceState(ctx); derr == nil {
+			res.dev = &dev
+		} else {
+			res.devErr = derr
+		}
+	}
+	return res
+}
+
 func (a *app) callTool(ctx context.Context, name string, raw json.RawMessage) (string, error) {
 	st := a.snapshot()
 	switch name {
+	case "mika_list_devices":
+		var empty struct{}
+		if err := decode(raw, &empty); err != nil {
+			return "", err
+		}
+		return clipText(formatDeviceList(st), 90000), nil
+
 	case "mika_doctor":
-		var empty struct{}
-		if err := decode(raw, &empty); err != nil {
-			return "", err
-		}
-		info, err := st.client.discover(ctx)
-		a.record(err)
-		if err != nil {
-			return "", err
-		}
-		var dev *deviceResponse
-		var devErr error
-		if slices.Contains(info.Capabilities, "device_state") {
-			d, derr := st.client.deviceState(ctx)
-			if derr == nil {
-				dev = &d
-			} else {
-				devErr = derr
-			}
-		}
-		return clipText(formatDoctor(st.client.base, info, dev, devErr), 90000), nil
-
-	case "mika_device_state":
-		var empty struct{}
-		if err := decode(raw, &empty); err != nil {
-			return "", err
-		}
-		dev, err := st.client.deviceState(ctx)
-		a.record(err)
-		if err != nil {
-			return "", err
-		}
-		return clipText(formatDeviceState(dev), 90000), nil
-
-	case "mika_task_status":
 		var in struct {
-			TaskID string `json:"task_id"`
+			Device string `json:"device"`
 		}
 		if err := decode(raw, &in); err != nil {
 			return "", err
 		}
-		task, err := st.client.taskStatus(ctx, strings.TrimSpace(in.TaskID))
-		a.record(err)
+		sel, err := validDeviceSelector(in.Device)
 		if err != nil {
 			return "", err
 		}
-		return clipText(formatTask(task, true), 90000), nil
+		// When device is omitted and multiple devices are configured, summarize every configured slot.
+		if sel == "" && len(st.devices) > 1 {
+			results := make([]doctorProbeResult, len(st.devices))
+			var wg sync.WaitGroup
+			for i, d := range st.devices {
+				wg.Add(1)
+				go func(idx int, entry deviceEntry) {
+					defer wg.Done()
+					results[idx] = a.probeDeviceDoctor(ctx, entry)
+				}(i, d)
+			}
+			wg.Wait()
+			return clipText(formatMultiDoctor(st, results), 90000), nil
+		}
+		dev, err := st.resolveReadyDevice(sel)
+		if err != nil {
+			return "", err
+		}
+		res := a.probeDeviceDoctor(ctx, dev)
+		if res.err != nil {
+			return "", res.err
+		}
+		return clipText(formatDoctor(dev, res.info, res.dev, res.devErr, st.allTokens), 90000), nil
+
+	case "mika_device_state":
+		var in struct {
+			Device string `json:"device"`
+		}
+		if err := decode(raw, &in); err != nil {
+			return "", err
+		}
+		dev, err := st.resolveReadyDevice(in.Device)
+		if err != nil {
+			return "", err
+		}
+		resp, err := dev.client.deviceState(ctx)
+		a.recordDevice(dev.slot, err)
+		if err != nil {
+			return "", err
+		}
+		return clipText(formatDeviceHeader(dev)+formatDeviceState(resp), 90000), nil
+
+	case "mika_task_status":
+		var in struct {
+			TaskID string `json:"task_id"`
+			Device string `json:"device"`
+		}
+		if err := decode(raw, &in); err != nil {
+			return "", err
+		}
+		dev, err := st.resolveReadyDevice(in.Device)
+		if err != nil {
+			return "", err
+		}
+		task, err := dev.client.taskStatus(ctx, strings.TrimSpace(in.TaskID))
+		a.recordDevice(dev.slot, err)
+		if err != nil {
+			return "", err
+		}
+		return clipText(formatDeviceHeader(dev)+formatTask(task, true), 90000), nil
 
 	case "mika_wait_task":
 		var in struct {
 			TaskID   string `json:"task_id"`
 			TimeoutS *int   `json:"timeout_s"`
+			Device   string `json:"device"`
 		}
 		if err := decode(raw, &in); err != nil {
+			return "", err
+		}
+		dev, err := st.resolveReadyDevice(in.Device)
+		if err != nil {
 			return "", err
 		}
 		waitS := st.defaultWait
 		if in.TimeoutS != nil {
 			waitS = *in.TimeoutS
 		}
-		task, err := st.client.waitTask(ctx, strings.TrimSpace(in.TaskID), waitS)
-		a.record(err)
+		task, err := dev.client.waitTask(ctx, strings.TrimSpace(in.TaskID), waitS)
+		a.recordDevice(dev.slot, err)
 		if err != nil {
 			return "", err
 		}
-		return clipText(formatTask(task, true), 90000), nil
+		return clipText(formatDeviceHeader(dev)+formatTask(task, true), 90000), nil
 
 	case "mika_list_tasks":
 		var in struct {
 			Limit  *int   `json:"limit"`
 			Before string `json:"before"`
+			Device string `json:"device"`
 		}
 		if err := decode(raw, &in); err != nil {
+			return "", err
+		}
+		dev, err := st.resolveReadyDevice(in.Device)
+		if err != nil {
 			return "", err
 		}
 		limit := defaultListLimit
 		if in.Limit != nil {
 			limit = *in.Limit
 		}
-		res, err := st.client.listTasks(ctx, limit, strings.TrimSpace(in.Before))
-		a.record(err)
+		res, err := dev.client.listTasks(ctx, limit, strings.TrimSpace(in.Before))
+		a.recordDevice(dev.slot, err)
 		if err != nil {
 			return "", err
 		}
-		return clipText(formatTaskList(res), 90000), nil
+		return clipText(formatDeviceHeader(dev)+formatTaskList(res), 90000), nil
 
 	case "mika_export_task":
 		var in struct {
 			TaskID    string `json:"task_id"`
 			MaxEvents *int   `json:"max_events"`
+			Device    string `json:"device"`
 		}
 		if err := decode(raw, &in); err != nil {
+			return "", err
+		}
+		dev, err := st.resolveReadyDevice(in.Device)
+		if err != nil {
 			return "", err
 		}
 		maxEvents := 50
@@ -254,20 +362,104 @@ func (a *app) callTool(ctx context.Context, name string, raw json.RawMessage) (s
 			}
 			maxEvents = *in.MaxEvents
 		}
-		rec, err := st.client.exportTask(ctx, strings.TrimSpace(in.TaskID))
-		a.record(err)
+		rec, err := dev.client.exportTask(ctx, strings.TrimSpace(in.TaskID))
+		a.recordDevice(dev.slot, err)
 		if err != nil {
 			return "", err
 		}
-		return clipText(formatExport(rec, maxEvents), 90000), nil
+		return clipText(formatDeviceHeader(dev)+formatExport(rec, maxEvents), 90000), nil
 	}
 	return "", fmt.Errorf("no tool %s", name)
 }
 
-func formatDoctor(base string, info discoveryInfo, dev *deviceResponse, devErr error) string {
+func formatDeviceHeader(d deviceEntry) string {
+	return fmt.Sprintf("Device: %s (%s) | Instance: %s\n", d.name, d.slot, d.maskedURL)
+}
+
+func formatDeviceList(st appState) string {
+	if len(st.devices) == 0 {
+		return "No Mika devices configured. Set instance_url and api_token in Settings › Extensions › Mika.\n"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Configured Mika devices (%d):\n", len(st.devices))
+	var dupNames []string
+	for _, d := range st.devices {
+		slotTag := fmt.Sprintf("%s (%d)", d.slot, d.index)
+		if d.isPrimary() {
+			slotTag = fmt.Sprintf("%s (%d, default)", d.slot, d.index)
+		}
+		fmt.Fprintf(&b, "- %s | slot: %s | instance: %s | status: %s\n",
+			d.name, slotTag, d.maskedURL, d.configState)
+		if d.configErr != "" {
+			fmt.Fprintf(&b, "  Config issue: %s\n", clipText(st.scrub(d.configErr), 300))
+		}
+		if h, ok := st.health[d.slot]; ok {
+			if h.lastErr != nil {
+				fmt.Fprintf(&b, "  Last error: %s\n", clipText(st.scrub(h.lastErr.Error()), 200))
+			} else if !h.lastOK.IsZero() {
+				fmt.Fprintf(&b, "  Last check: OK at %s\n", h.lastOK.UTC().Format(time.RFC3339))
+			}
+		}
+		if st.hasDuplicateName(d.name) && !slices.ContainsFunc(dupNames, func(s string) bool { return strings.EqualFold(s, d.name) }) {
+			dupNames = append(dupNames, d.name)
+		}
+	}
+	if len(dupNames) > 0 {
+		fmt.Fprintf(&b, "\nWarning: duplicate device name(s) detected (%s). Address devices by slot alias (primary/secondary/tertiary or 1/2/3) or assign unique names in Settings › Extensions.\n",
+			strings.Join(dupNames, ", "))
+	}
+	b.WriteString("\nPass optional device=\"<name>\" or slot alias (primary/secondary/tertiary, 1/2/3) to any mika_* tool; omit device to use slot 1 (primary).\n")
+	return b.String()
+}
+
+func formatMultiDoctor(st appState, results []doctorProbeResult) string {
+	okCount := 0
+	for _, r := range results {
+		if r.entry.ready() && r.err == nil {
+			okCount++
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Mika Doctor Summary: %d/%d devices reachable\n", okCount, len(results))
+	var dupNames []string
+	for _, d := range st.devices {
+		if st.hasDuplicateName(d.name) && !slices.ContainsFunc(dupNames, func(s string) bool { return strings.EqualFold(s, d.name) }) {
+			dupNames = append(dupNames, d.name)
+		}
+	}
+	if len(dupNames) > 0 {
+		fmt.Fprintf(&b, "Warning: duplicate device name(s) (%s); use slot aliases (primary/secondary/tertiary or 1/2/3) or rename devices in Settings › Extensions.\n",
+			strings.Join(dupNames, ", "))
+	}
+	for _, r := range results {
+		slotTag := r.entry.slot
+		if r.entry.isPrimary() {
+			slotTag += ", default"
+		}
+		fmt.Fprintf(&b, "\n=== Device: %s (%s) ===\n", r.entry.name, slotTag)
+		switch {
+		case !r.entry.ready():
+			fmt.Fprintf(&b, "Mika Doctor: NOT READY (%s)\n", r.entry.configState)
+			fmt.Fprintf(&b, "Instance: %s\n", r.entry.maskedURL)
+			if r.entry.configErr != "" {
+				fmt.Fprintf(&b, "Error: %s\n", clipText(st.scrub(r.entry.configErr), 300))
+			}
+		case r.err != nil:
+			b.WriteString("Mika Doctor: ERROR\n")
+			fmt.Fprintf(&b, "Instance: %s\n", r.entry.maskedURL)
+			fmt.Fprintf(&b, "Error: %s\n", clipText(st.scrub(r.err.Error()), 300))
+		default:
+			b.WriteString(formatDoctor(r.entry, r.info, r.dev, r.devErr, st.allTokens))
+		}
+	}
+	return b.String()
+}
+
+func formatDoctor(d deviceEntry, info discoveryInfo, dev *deviceResponse, devErr error, allTokens []string) string {
 	var b strings.Builder
 	b.WriteString("Mika Doctor: OK\n")
-	fmt.Fprintf(&b, "Instance: %s\n", maskInstanceURL(base))
+	fmt.Fprintf(&b, "Device: %s (%s)\n", d.name, d.slot)
+	fmt.Fprintf(&b, "Instance: %s\n", d.maskedURL)
 	fmt.Fprintf(&b, "Server version: %s | API version: %d\n", info.ServerVersion, info.APIVersion)
 	if len(info.Capabilities) > 0 {
 		fmt.Fprintf(&b, "Capabilities: %s\n", strings.Join(info.Capabilities, ", "))
@@ -280,7 +472,7 @@ func formatDoctor(base string, info discoveryInfo, dev *deviceResponse, devErr e
 	if dev != nil {
 		b.WriteString("\n" + formatDeviceState(*dev))
 	} else if devErr != nil {
-		fmt.Fprintf(&b, "Device state: unavailable (%s)\n", clipText(devErr.Error(), 200))
+		fmt.Fprintf(&b, "Device state: unavailable (%s)\n", clipText(scrubSecrets(devErr.Error(), allTokens), 200))
 	} else {
 		b.WriteString("Device state: not advertised by server\n")
 	}

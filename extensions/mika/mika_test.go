@@ -19,11 +19,17 @@ import (
 	"github.com/nwverse/persona/sdk/go/wire"
 )
 
-const testToken = "synthetic-mika-bearer-secret-9876543210"
+const (
+	testToken          = "synthetic-mika-bearer-secret-9876543210"
+	testSecondaryToken = "synthetic-mika-secondary-token-1122334455"
+	testTertiaryToken  = "synthetic-mika-tertiary-token-6677889900"
+)
 
 type fakeMika struct {
 	srv            *httptest.Server
 	mu             sync.Mutex
+	expectedToken  string
+	serverVersion  string
 	requests       []recordedReq
 	forceStatus    int
 	forceErrCode   string
@@ -46,6 +52,7 @@ type recordedReq struct {
 	RawQuery    string
 	ContentType string
 	ClientHdr   string
+	AuthHdr     string
 	Origin      string
 	Body        string
 }
@@ -106,10 +113,16 @@ func sampleTasks() []remoteTask {
 }
 
 func newFakeMika(t *testing.T) *fakeMika {
+	return newFakeMikaWith(t, testToken, "0.1.28", sampleTasks())
+}
+
+func newFakeMikaWith(t *testing.T, expectedToken, serverVersion string, tasks []remoteTask) *fakeMika {
 	t.Helper()
 	f := &fakeMika{
-		waitChanged: true,
-		tasks:       sampleTasks(),
+		expectedToken: expectedToken,
+		serverVersion: serverVersion,
+		waitChanged:   true,
+		tasks:         slices.Clone(tasks),
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, _ := io.ReadAll(r.Body)
@@ -120,9 +133,12 @@ func newFakeMika(t *testing.T) *fakeMika {
 			RawQuery:    r.URL.RawQuery,
 			ContentType: r.Header.Get("Content-Type"),
 			ClientHdr:   r.Header.Get(clientHeaderName),
+			AuthHdr:     r.Header.Get("Authorization"),
 			Origin:      r.Header.Get("Origin"),
 			Body:        string(bodyBytes),
 		})
+		expectedTok := f.expectedToken
+		srvVer := f.serverVersion
 		forceStatus := f.forceStatus
 		forceCode := f.forceErrCode
 		forceMsg := f.forceErrMsg
@@ -142,7 +158,7 @@ func newFakeMika(t *testing.T) *fakeMika {
 			writeMikaError(w, http.StatusForbidden, "access_denied", "Browser requests are not allowed", nil)
 			return
 		}
-		if r.Header.Get("Authorization") != "Bearer "+testToken {
+		if r.Header.Get("Authorization") != "Bearer "+expectedTok {
 			writeMikaError(w, http.StatusUnauthorized, "access_denied", "Missing or wrong access token", map[string]string{"WWW-Authenticate": "Bearer"})
 			return
 		}
@@ -161,7 +177,7 @@ func newFakeMika(t *testing.T) *fakeMika {
 			hist := false
 			_ = json.NewEncoder(w).Encode(discoveryInfo{
 				APIVersion:     1,
-				ServerVersion:  "0.1.28",
+				ServerVersion:  srvVer,
 				Capabilities:   []string{"tasks", "task_steer", "task_recovery", "device_state", "run_export"},
 				HistoryEnabled: &hist,
 				Limits:         discoveryLimit{MaxWaitS: 50, MaxGoal: 4000, MaxAnswer: 2000, MaxSteer: 4000},
@@ -398,9 +414,18 @@ func (f *fakeMika) app() *app {
 		panic(err)
 	}
 	return &app{
-		client:      newClient(base, testToken),
+		devices: []deviceEntry{{
+			slot:        slotPrimary,
+			index:       1,
+			name:        "default",
+			maskedURL:   maskInstanceURL(base),
+			configState: deviceStateReady,
+			client:      newClient(base, f.expectedToken),
+		}},
+		allTokens:   collectScrubTokens(f.expectedToken),
 		defaultWait: 25,
 		receipts:    newWriteStore(""),
+		health:      map[string]deviceHealth{},
 	}
 }
 
@@ -416,11 +441,35 @@ func TestManifest(t *testing.T) {
 	if err := json.Unmarshal(manifest, &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.ID != "mika" || m.Version != "0.1.0" {
+	if m.ID != "mika" || m.Version != "0.2.0" {
 		t.Fatalf("unexpected identity: %+v", m)
 	}
-	if len(m.Secrets) != 1 || m.Secrets[0].Name != "api_token" || !m.Secrets[0].Required {
+	if len(m.Secrets) != 3 ||
+		m.Secrets[0].Name != "api_token" || !m.Secrets[0].Required ||
+		m.Secrets[1].Name != "secondary_api_token" || m.Secrets[1].Required ||
+		m.Secrets[2].Name != "tertiary_api_token" || m.Secrets[2].Required {
 		t.Fatalf("unexpected secrets: %+v", m.Secrets)
+	}
+	// Configuration must keep only instance_url required and must never store plaintext tokens.
+	var rawManifest map[string]any
+	if err := json.Unmarshal(manifest, &rawManifest); err != nil {
+		t.Fatal(err)
+	}
+	cfg := rawManifest["configuration"].(map[string]any)
+	req := cfg["required"].([]any)
+	if len(req) != 1 || req[0] != "instance_url" {
+		t.Fatalf("unexpected required config fields: %v", req)
+	}
+	props := cfg["properties"].(map[string]any)
+	for _, wantProp := range []string{"instance_name", "instance_url", "secondary_name", "secondary_url", "tertiary_name", "tertiary_url", "default_wait_seconds"} {
+		if _, ok := props[wantProp]; !ok {
+			t.Fatalf("missing configuration property %q", wantProp)
+		}
+	}
+	for k := range props {
+		if strings.Contains(strings.ToLower(k), "token") || strings.Contains(strings.ToLower(k), "secret") {
+			t.Fatalf("plaintext credential property %q must not live in configuration", k)
+		}
 	}
 	if m.Contributes == nil || len(m.Contributes.Connectors) != 1 {
 		t.Fatalf("unexpected connectors: %+v", m.Contributes)
@@ -444,15 +493,15 @@ func TestInitValidation(t *testing.T) {
 		InitializeParams: wire.InitializeParams{
 			Config:    json.RawMessage(`{"instance_url":"` + f.srv.URL + `","default_wait_seconds":42}`),
 			Secrets:   map[string]string{"api_token": testToken},
-			Extension: &wire.ExtensionInfo{ID: "mika", Version: "0.1.0", DataDir: t.TempDir()},
+			Extension: &wire.ExtensionInfo{ID: "mika", Version: "0.2.0", DataDir: t.TempDir()},
 		},
 	}
 	if _, err := a.init(t.Context(), in, nil); err != nil {
 		t.Fatalf("valid init failed: %v", err)
 	}
 	snap := a.snapshot()
-	if snap.defaultWait != 42 || !strings.HasSuffix(snap.client.base, "/api/v1") {
-		t.Fatalf("unexpected init state: wait=%d base=%q", snap.defaultWait, snap.client.base)
+	if snap.defaultWait != 42 || len(snap.devices) != 1 || snap.devices[0].name != "default" || !strings.HasSuffix(snap.devices[0].client.base, "/api/v1") {
+		t.Fatalf("unexpected init state: wait=%d devices=%+v", snap.defaultWait, snap.devices)
 	}
 
 	badWait := &ext.Init{
@@ -657,8 +706,8 @@ func TestWriteActions(t *testing.T) {
 
 	// mika_run_task describe + do (verifies conversation_id -> conversation wire mapping)
 	runArgs := json.RawMessage(`{"goal":"Open Notes and draft agenda","conversation_id":"` + conv + `","request_id":"` + reqUUID + `"}`)
-	desc, err := describeAction("mika_run_task", runArgs)
-	if err != nil || !strings.Contains(desc["summary"].(string), "Open Notes and draft agenda") {
+	desc, err := a.describeAction("mika_run_task", runArgs)
+	if err != nil || !strings.Contains(desc["summary"].(string), "Open Notes and draft agenda") || !strings.Contains(desc["summary"].(string), "default (primary, ") {
 		t.Fatalf("describe mika_run_task: err=%v desc=%+v", err, desc)
 	}
 	res, err := a.doAction(t.Context(), "hub-run-1", "mika_run_task", runArgs)
@@ -673,16 +722,16 @@ func TestWriteActions(t *testing.T) {
 	}
 
 	// Validation errors on mika_run_task
-	if _, err := describeAction("mika_run_task", json.RawMessage(`{"goal":"hi","conversation_id":"bad-conv"}`)); err == nil {
+	if _, err := a.describeAction("mika_run_task", json.RawMessage(`{"goal":"hi","conversation_id":"bad-conv"}`)); err == nil {
 		t.Fatal("accepted invalid conversation_id")
 	}
-	if _, err := describeAction("mika_run_task", json.RawMessage(`{"goal":"hi","request_id":"NOT-A-UUID"}`)); err == nil {
+	if _, err := a.describeAction("mika_run_task", json.RawMessage(`{"goal":"hi","request_id":"NOT-A-UUID"}`)); err == nil {
 		t.Fatal("accepted invalid request_id UUID")
 	}
 
 	// mika_answer
 	ansArgs := json.RawMessage(`{"task_id":"task-ask-3","text":"Open Family group"}`)
-	if _, err := describeAction("mika_answer", ansArgs); err != nil {
+	if _, err := a.describeAction("mika_answer", ansArgs); err != nil {
 		t.Fatalf("describe mika_answer: %v", err)
 	}
 	res, err = a.doAction(t.Context(), "hub-ans-1", "mika_answer", ansArgs)
@@ -692,7 +741,7 @@ func TestWriteActions(t *testing.T) {
 
 	// mika_steer_task (HTTP 202)
 	steerArgs := json.RawMessage(`{"task_id":"task-run-2","text":"Only include today's notes"}`)
-	if _, err := describeAction("mika_steer_task", steerArgs); err != nil {
+	if _, err := a.describeAction("mika_steer_task", steerArgs); err != nil {
 		t.Fatalf("describe mika_steer_task: %v", err)
 	}
 	res, err = a.doAction(t.Context(), "hub-steer-1", "mika_steer_task", steerArgs)
@@ -702,7 +751,7 @@ func TestWriteActions(t *testing.T) {
 
 	// mika_cancel_task (HTTP 202 and HTTP 200 already finished; checks JSON {} + Content-Type)
 	cancelArgs := json.RawMessage(`{"task_id":"task-run-2"}`)
-	if _, err := describeAction("mika_cancel_task", cancelArgs); err != nil {
+	if _, err := a.describeAction("mika_cancel_task", cancelArgs); err != nil {
 		t.Fatalf("describe mika_cancel_task: %v", err)
 	}
 	res, err = a.doAction(t.Context(), "hub-cancel-1", "mika_cancel_task", cancelArgs)
@@ -1039,16 +1088,33 @@ func TestConnectorDispatch(t *testing.T) {
 		t.Fatalf("tools.list: %v", err)
 	}
 	m := res.(map[string]any)
-	if len(m["tools"].([]tool)) != 6 {
-		t.Fatalf("expected 6 read tools, got %d", len(m["tools"].([]tool)))
+	readList := m["tools"].([]tool)
+	if len(readList) != 7 {
+		t.Fatalf("expected 7 read tools, got %d", len(readList))
+	}
+	for _, tl := range readList {
+		props := tl.InputSchema["properties"].(map[string]any)
+		if tl.Name == "mika_list_devices" {
+			continue
+		}
+		if _, ok := props["device"]; !ok {
+			t.Fatalf("read tool %s missing optional device parameter", tl.Name)
+		}
 	}
 	res, err = a.connector(context.Background(), "actions.list", json.RawMessage(`{"contribution":"mika"}`))
 	if err != nil {
 		t.Fatalf("actions.list: %v", err)
 	}
 	m = res.(map[string]any)
-	if len(m["tools"].([]tool)) != 4 {
-		t.Fatalf("expected 4 action tools, got %d", len(m["tools"].([]tool)))
+	actList := m["tools"].([]tool)
+	if len(actList) != 4 {
+		t.Fatalf("expected 4 action tools, got %d", len(actList))
+	}
+	for _, tl := range actList {
+		props := tl.InputSchema["properties"].(map[string]any)
+		if _, ok := props["device"]; !ok {
+			t.Fatalf("action tool %s missing optional device parameter", tl.Name)
+		}
 	}
 	if _, err := a.connector(context.Background(), "actions.do", json.RawMessage(`{"contribution":"mika","name":"mika_cancel_task","args":{"task_id":"task-run-2"}}`)); err == nil {
 		t.Fatal("accepted actions.do without request_id")

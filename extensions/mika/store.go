@@ -10,11 +10,23 @@ import (
 	"time"
 )
 
+const (
+	maxReceiptKeyLen  = 160
+	maxReceiptEntries = 512
+)
+
 type writeReceipt struct {
 	Key       string    `json:"key"`
 	Status    string    `json:"status"`
 	StartedAt time.Time `json:"started_at"`
 	Text      string    `json:"text,omitempty"`
+}
+
+func receiptKey(slot, requestID string) string {
+	if slot == "" {
+		return requestID
+	}
+	return slot + ":" + requestID
 }
 
 type writeStore struct {
@@ -46,7 +58,7 @@ func openWriteStore(dir string) (*writeStore, error) {
 		return nil, errors.New("Mika write receipts are invalid")
 	}
 	for id, r := range s.entries {
-		if len(id) == 0 || len(id) > 128 || (r.Status != "pending" && r.Status != "done") {
+		if len(id) == 0 || len(id) > maxReceiptKeyLen || (r.Status != "pending" && r.Status != "done") {
 			return nil, errors.New("invalid Mika write receipt")
 		}
 	}
@@ -65,7 +77,7 @@ func (s *writeStore) commit(id, key string, fn func() (string, error)) (string, 
 		}
 		return "", errors.New("the previous Mika action has an unknown outcome; inspect task status before retrying")
 	}
-	if len(s.entries) >= 256 {
+	if len(s.entries) >= maxReceiptEntries {
 		return "", errors.New("Mika write receipt history is full; preserve it before more actions")
 	}
 	s.entries[id] = writeReceipt{Key: key, Status: "pending", StartedAt: time.Now().UTC()}

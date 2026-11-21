@@ -4,6 +4,7 @@ import "strings"
 
 type texts struct {
 	title, connection, recentTasks, taskDetail               string
+	devices, configError, viewing, primaryTag, devicePrefix  string
 	online, offline, serverRow, deviceRow, notConfigured     string
 	ready, locked, helperOffline, deviceUnavailable          string
 	refresh, back, more, noTasks, noGoal                     string
@@ -18,6 +19,7 @@ type texts struct {
 var locales = map[string]*texts{
 	"en": {
 		title: "Mika", connection: "Connection", recentTasks: "Recent tasks", taskDetail: "Task details",
+		devices: "Devices", configError: "Not ready", viewing: "Viewing", primaryTag: "Primary", devicePrefix: "Device: ",
 		online: "Online", offline: "Offline", serverRow: "Mika server", deviceRow: "Phone status",
 		notConfigured: "Set the Mika instance URL and api_token in Settings › Extensions first.",
 		ready:         "Ready", locked: "Locked / screen off", helperOffline: "Helper offline", deviceUnavailable: "Unavailable",
@@ -31,6 +33,7 @@ var locales = map[string]*texts{
 	},
 	"ja": {
 		title: "Mika", connection: "接続状態", recentTasks: "最近のタスク", taskDetail: "タスク詳細",
+		devices: "端末一覧", configError: "設定不備", viewing: "表示中", primaryTag: "メイン", devicePrefix: "端末: ",
 		online: "オンライン", offline: "オフライン", serverRow: "Mika サーバー", deviceRow: "端末状態",
 		notConfigured: "設定 › 拡張機能で Mika インスタンス URL とアクセストークンを設定してください。",
 		ready:         "準備完了", locked: "ロック中 / 画面オフ", helperOffline: "ヘルパー未接続", deviceUnavailable: "取得不可",
@@ -44,6 +47,7 @@ var locales = map[string]*texts{
 	},
 	"zh-Hans": {
 		title: "Mika 手机助手", connection: "连接状态", recentTasks: "最近任务", taskDetail: "任务详情",
+		devices: "设备列表", configError: "配置不完整", viewing: "当前查看", primaryTag: "主设备", devicePrefix: "设备：",
 		online: "在线", offline: "离线", serverRow: "Mika 服务", deviceRow: "手机状态",
 		notConfigured: "请先在「设置 › 扩展」中填写 Mika 实例地址和访问令牌。",
 		ready:         "就绪", locked: "锁屏 / 息屏", helperOffline: "助手未连接", deviceUnavailable: "不可用",

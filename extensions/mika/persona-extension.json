@@ -2,9 +2,9 @@
   "manifest_version": 1,
   "id": "mika",
   "name": "Mika 手机助手",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "icon": "assets/icon.png",
-  "description": "在 Persona 里通过局域网、Tailscale 或本机转发连接安卓手机上的 Mika（/api/v1）：检查服务与手机助手健康状态、查看只读设备状态与最近任务、导出脱敏运行记录；经确认后派发手机任务、回复追问、运行中追加指示或取消任务。Bearer 令牌加密存在 hub，不执行远程解锁，付款与接管确认始终留在手机上。",
+  "description": "在 Persona 里通过局域网、Tailscale 或本机转发同时连接与管理多台安卓手机上的 Mika（/api/v1，支持最多 3 台命名设备独立令牌隔离）：检查服务与手机助手健康状态、查看只读设备状态与最近任务、导出脱敏运行记录；经确认后按设备派发手机任务、回复追问、运行中追加指示或取消任务。Bearer 令牌加密存在 hub，不执行远程解锁，付款与接管确认始终留在手机上。",
   "publisher": "nwverse",
   "homepage": "https://github.com/nwverse/persona-extensions/blob/main/extensions/mika/README.md",
   "tags": ["Mika", "Android", "手机助手", "自动化", "自托管"],
@@ -41,10 +41,41 @@
     "type": "object",
     "required": ["instance_url"],
     "properties": {
+      "instance_name": {
+        "type": "string",
+        "title": "主设备名称",
+        "description": "可选，便于多台手机时按名称指定目标设备（如 A16）；留空默认使用 default",
+        "maxLength": 40,
+        "default": "default"
+      },
       "instance_url": {
         "type": "string",
-        "title": "Mika 实例地址",
-        "description": "手机上 Mika「设置 › 连接电脑」显示的地址，如 http://<局域网或Tailscale地址>:8765、http://127.0.0.1:8765 或 https://mika.example.com（可带 /api/v1，不要填 /mcp；公网地址必须使用 HTTPS）",
+        "title": "主设备 Mika 实例地址",
+        "description": "主手机上 Mika「设置 › 连接电脑」显示的地址，如 http://<局域网或Tailscale地址>:8765、http://127.0.0.1:8765 或 https://mika.example.com（可带 /api/v1，不要填 /mcp；公网地址必须使用 HTTPS）",
+        "format": "uri"
+      },
+      "secondary_name": {
+        "type": "string",
+        "title": "第 2 台设备名称（可选）",
+        "description": "可选，第 2 台安卓手机的自定义名称（如 S25+）；配置第 2 台地址且留空名称时默认使用 secondary",
+        "maxLength": 40
+      },
+      "secondary_url": {
+        "type": "string",
+        "title": "第 2 台设备 Mika 实例地址（可选）",
+        "description": "可选，第 2 台手机的 Mika 实例地址（同主设备地址校验规则；同时需在下方配置第 2 台访问令牌）",
+        "format": "uri"
+      },
+      "tertiary_name": {
+        "type": "string",
+        "title": "第 3 台设备名称（可选）",
+        "description": "可选，第 3 台安卓手机的自定义名称；配置第 3 台地址且留空名称时默认使用 tertiary",
+        "maxLength": 40
+      },
+      "tertiary_url": {
+        "type": "string",
+        "title": "第 3 台设备 Mika 实例地址（可选）",
+        "description": "可选，第 3 台手机的 Mika 实例地址（同主设备地址校验规则；同时需在下方配置第 3 台访问令牌）",
         "format": "uri"
       },
       "default_wait_seconds": {
@@ -57,12 +88,28 @@
       }
     }
   },
-  "secrets": [{
-    "name": "api_token",
-    "title": "Mika 访问令牌",
-    "description": "在手机端 Mika「设置 › 连接电脑」中复制的访问令牌；加密保存在 hub，仅通过 Authorization: Bearer 发往配置的 Mika 实例",
-    "required": true,
-    "hint": "last4"
-  }],
+  "secrets": [
+    {
+      "name": "api_token",
+      "title": "主设备 Mika 访问令牌",
+      "description": "在主手机端 Mika「设置 › 连接电脑」中复制的访问令牌；加密保存在 hub，仅通过 Authorization: Bearer 发往主设备实例",
+      "required": true,
+      "hint": "last4"
+    },
+    {
+      "name": "secondary_api_token",
+      "title": "第 2 台设备 Mika 访问令牌（可选）",
+      "description": "配置第 2 台设备时填写；加密保存在 hub，仅通过 Authorization: Bearer 发往第 2 台设备实例",
+      "required": false,
+      "hint": "last4"
+    },
+    {
+      "name": "tertiary_api_token",
+      "title": "第 3 台设备 Mika 访问令牌（可选）",
+      "description": "配置第 3 台设备时填写；加密保存在 hub，仅通过 Authorization: Bearer 发往第 3 台设备实例",
+      "required": false,
+      "hint": "last4"
+    }
+  ],
   "permissions": {"network": []}
 }

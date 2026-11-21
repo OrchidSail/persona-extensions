@@ -13,6 +13,7 @@ type runTaskArgs struct {
 	ConversationID string `json:"conversation_id,omitempty"`
 	Conversation   string `json:"conversation,omitempty"`
 	RequestID      string `json:"request_id,omitempty"`
+	Device         string `json:"device,omitempty"`
 }
 
 func (in *runTaskArgs) normalize() error {
@@ -43,19 +44,27 @@ func (in *runTaskArgs) normalize() error {
 		}
 	}
 	in.RequestID = reqID
+	devSel, err := validDeviceSelector(in.Device)
+	if err != nil {
+		return err
+	}
+	in.Device = devSel
 	return nil
 }
 
 type taskTextArgs struct {
 	TaskID string `json:"task_id"`
 	Text   string `json:"text"`
+	Device string `json:"device,omitempty"`
 }
 
 type cancelTaskArgs struct {
 	TaskID string `json:"task_id"`
+	Device string `json:"device,omitempty"`
 }
 
-func describeAction(name string, raw json.RawMessage) (map[string]any, error) {
+func (a *app) describeAction(name string, raw json.RawMessage) (map[string]any, error) {
+	st := a.snapshot()
 	var summary string
 	switch name {
 	case "mika_run_task":
@@ -66,8 +75,12 @@ func describeAction(name string, raw json.RawMessage) (map[string]any, error) {
 		if err := in.normalize(); err != nil {
 			return nil, err
 		}
+		dev, err := st.resolveReadyDevice(in.Device)
+		if err != nil {
+			return nil, err
+		}
 		var b strings.Builder
-		b.WriteString("Start a Mika task on the Android phone:\n\n")
+		fmt.Fprintf(&b, "[%s] Start a Mika task on the Android phone:\n\n", dev.confirmLabel())
 		b.WriteString(in.Goal)
 		if in.ConversationID != "" {
 			fmt.Fprintf(&b, "\n\nConversation: %s", in.ConversationID)
@@ -91,7 +104,11 @@ func describeAction(name string, raw json.RawMessage) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		summary = fmt.Sprintf("Answer Mika question for task %s:\n\n%s", id, text)
+		dev, err := st.resolveReadyDevice(in.Device)
+		if err != nil {
+			return nil, err
+		}
+		summary = fmt.Sprintf("[%s] Answer Mika question for task %s:\n\n%s", dev.confirmLabel(), id, text)
 
 	case "mika_steer_task":
 		var in taskTextArgs
@@ -106,7 +123,11 @@ func describeAction(name string, raw json.RawMessage) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		summary = fmt.Sprintf("Send follow-up instruction to running Mika task %s:\n\n%s", id, text)
+		dev, err := st.resolveReadyDevice(in.Device)
+		if err != nil {
+			return nil, err
+		}
+		summary = fmt.Sprintf("[%s] Send follow-up instruction to running Mika task %s:\n\n%s", dev.confirmLabel(), id, text)
 
 	case "mika_cancel_task":
 		var in cancelTaskArgs
@@ -117,7 +138,11 @@ func describeAction(name string, raw json.RawMessage) (map[string]any, error) {
 		if err := validTaskID(id); err != nil {
 			return nil, err
 		}
-		summary = fmt.Sprintf("Cancel Mika task %s", id)
+		dev, err := st.resolveReadyDevice(in.Device)
+		if err != nil {
+			return nil, err
+		}
+		summary = fmt.Sprintf("[%s] Cancel Mika task %s", dev.confirmLabel(), id)
 
 	default:
 		return nil, fmt.Errorf("unknown action %q", name)
@@ -131,6 +156,7 @@ func describeAction(name string, raw json.RawMessage) (map[string]any, error) {
 func (a *app) doAction(ctx context.Context, requestID, name string, raw json.RawMessage) (map[string]any, error) {
 	st := a.snapshot()
 	var (
+		dev       deviceEntry
 		canonical any
 		fn        func() (string, error)
 	)
@@ -143,22 +169,31 @@ func (a *app) doAction(ctx context.Context, requestID, name string, raw json.Raw
 		if err := in.normalize(); err != nil {
 			return nil, err
 		}
-		canonical = in
+		var err error
+		dev, err = st.resolveReadyDevice(in.Device)
+		if err != nil {
+			return nil, err
+		}
+		canonical = runTaskArgs{
+			Goal:           in.Goal,
+			ConversationID: in.ConversationID,
+			RequestID:      in.RequestID,
+		}
 		fn = func() (string, error) {
-			task, err := st.client.startTask(ctx, startTaskRequest{
+			task, err := dev.client.startTask(ctx, startTaskRequest{
 				Goal:         in.Goal,
 				Conversation: in.ConversationID,
 				RequestID:    in.RequestID,
 			})
-			a.record(err)
+			a.recordDevice(dev.slot, err)
 			if err != nil {
 				if in.RequestID != "" && !isDefiniteRefusal(err) {
-					return "", fmt.Errorf("%w (check mika_task_status with task_id=%s before retrying)", err, in.RequestID)
+					return "", fmt.Errorf("%w (check mika_task_status on %s with task_id=%s before retrying)", err, dev.label(), in.RequestID)
 				}
 				return "", err
 			}
 			var b strings.Builder
-			fmt.Fprintf(&b, "Started Mika task %s (status: %s)\n", task.TaskID, task.Status)
+			fmt.Fprintf(&b, "Started Mika task %s on %s (status: %s)\n", task.TaskID, dev.label(), task.Status)
 			if task.Conversation != "" {
 				fmt.Fprintf(&b, "Conversation: %s\n", task.Conversation)
 			}
@@ -179,14 +214,18 @@ func (a *app) doAction(ctx context.Context, requestID, name string, raw json.Raw
 		if err != nil {
 			return nil, err
 		}
+		dev, err = st.resolveReadyDevice(in.Device)
+		if err != nil {
+			return nil, err
+		}
 		canonical = taskTextArgs{TaskID: id, Text: text}
 		fn = func() (string, error) {
-			res, err := st.client.answerTask(ctx, id, text)
-			a.record(err)
+			res, err := dev.client.answerTask(ctx, id, text)
+			a.recordDevice(dev.slot, err)
 			if err != nil {
 				return "", err
 			}
-			return fmt.Sprintf("Answer submitted for Mika task %s (accepted: %t). Continue with mika_wait_task.\n", res.TaskID, res.Accepted), nil
+			return fmt.Sprintf("Answer submitted for Mika task %s on %s (accepted: %t). Continue with mika_wait_task.\n", res.TaskID, dev.label(), res.Accepted), nil
 		}
 
 	case "mika_steer_task":
@@ -202,15 +241,19 @@ func (a *app) doAction(ctx context.Context, requestID, name string, raw json.Raw
 		if err != nil {
 			return nil, err
 		}
+		dev, err = st.resolveReadyDevice(in.Device)
+		if err != nil {
+			return nil, err
+		}
 		canonical = taskTextArgs{TaskID: id, Text: text}
 		fn = func() (string, error) {
-			res, err := st.client.steerTask(ctx, id, text)
-			a.record(err)
+			res, err := dev.client.steerTask(ctx, id, text)
+			a.recordDevice(dev.slot, err)
 			if err != nil {
 				return "", err
 			}
-			return fmt.Sprintf("Instruction queued for Mika task %s (message_id: %s, accepted: %t). Check steers in mika_task_status to see whether it becomes joined.\n",
-				res.TaskID, res.MessageID, res.Accepted), nil
+			return fmt.Sprintf("Instruction queued for Mika task %s on %s (message_id: %s, accepted: %t). Check steers in mika_task_status to see whether it becomes joined.\n",
+				res.TaskID, dev.label(), res.MessageID, res.Accepted), nil
 		}
 
 	case "mika_cancel_task":
@@ -222,17 +265,22 @@ func (a *app) doAction(ctx context.Context, requestID, name string, raw json.Raw
 		if err := validTaskID(id); err != nil {
 			return nil, err
 		}
+		var err error
+		dev, err = st.resolveReadyDevice(in.Device)
+		if err != nil {
+			return nil, err
+		}
 		canonical = cancelTaskArgs{TaskID: id}
 		fn = func() (string, error) {
-			res, err := st.client.cancelTask(ctx, id)
-			a.record(err)
+			res, err := dev.client.cancelTask(ctx, id)
+			a.recordDevice(dev.slot, err)
 			if err != nil {
 				return "", err
 			}
 			if res.Accepted {
-				return fmt.Sprintf("Cancellation requested for Mika task %s (accepted: true). Poll mika_task_status until status is cancelled.\n", res.TaskID), nil
+				return fmt.Sprintf("Cancellation requested for Mika task %s on %s (accepted: true). Poll mika_task_status until status is cancelled.\n", res.TaskID, dev.label()), nil
 			}
-			return fmt.Sprintf("Mika task %s was already finished (accepted: false, status: %s).\n", res.TaskID, res.Status), nil
+			return fmt.Sprintf("Mika task %s on %s was already finished (accepted: false, status: %s).\n", res.TaskID, dev.label(), res.Status), nil
 		}
 
 	default:
@@ -240,13 +288,14 @@ func (a *app) doAction(ctx context.Context, requestID, name string, raw json.Raw
 	}
 
 	keyData, err := json.Marshal(struct {
-		Action string `json:"action"`
-		Args   any    `json:"args"`
-	}{Action: name, Args: canonical})
+		DeviceSlot string `json:"device_slot"`
+		Action     string `json:"action"`
+		Args       any    `json:"args"`
+	}{DeviceSlot: dev.slot, Action: name, Args: canonical})
 	if err != nil {
 		return nil, err
 	}
-	text, err := st.receipts.commit(requestID, string(keyData), fn)
+	text, err := st.receipts.commit(receiptKey(dev.slot, requestID), string(keyData), fn)
 	if err != nil {
 		return nil, err
 	}

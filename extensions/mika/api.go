@@ -279,12 +279,13 @@ func maskLabel(s string) string {
 }
 
 type client struct {
-	base  string
-	token string
-	http  *http.Client
+	base        string
+	token       string
+	scrubTokens []string
+	http        *http.Client
 }
 
-func newClient(base, token string) *client {
+func newClient(base, token string, extraScrubTokens ...string) *client {
 	transport := &http.Transport{
 		Proxy:                 nil, // direct LAN/Tailscale/loopback access without environment proxy interference
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -294,9 +295,12 @@ func newClient(base, token string) *client {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	trimmedToken := strings.TrimSpace(token)
+	allTokens := collectScrubTokens(trimmedToken, extraScrubTokens...)
 	return &client{
-		base:  strings.TrimRight(strings.TrimSpace(base), "/"),
-		token: strings.TrimSpace(token),
+		base:        strings.TrimRight(strings.TrimSpace(base), "/"),
+		token:       trimmedToken,
+		scrubTokens: allTokens,
 		http: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -304,6 +308,31 @@ func newClient(base, token string) *client {
 			},
 		},
 	}
+}
+
+func collectScrubTokens(first string, more ...string) []string {
+	seen := make(map[string]struct{}, 1+len(more))
+	out := make([]string, 0, 1+len(more))
+	add := func(raw string) {
+		tok := strings.TrimSpace(raw)
+		if tok == "" {
+			return
+		}
+		if _, ok := seen[tok]; ok {
+			return
+		}
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+	}
+	add(first)
+	for _, tok := range more {
+		add(tok)
+	}
+	// Replace longer tokens first to avoid partial substring collisions.
+	slices.SortFunc(out, func(a, b string) int {
+		return len(b) - len(a)
+	})
+	return out
 }
 
 func (c *client) configured() bool {
@@ -329,7 +358,7 @@ func (c *client) do(ctx context.Context, timeout time.Duration, method, path str
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
-		return errors.New(scrubSecret(err.Error(), c.token))
+		return errors.New(scrubSecrets(err.Error(), c.scrubTokens))
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Accept", "application/json")
@@ -348,7 +377,7 @@ func (c *client) do(ctx context.Context, timeout time.Duration, method, path str
 		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 			return fmt.Errorf("%w: request canceled", errUnavailable)
 		}
-		return fmt.Errorf("%w: %s", errUnavailable, sanitizeNetError(err, c.token))
+		return fmt.Errorf("%w: %s", errUnavailable, sanitizeNetError(err, c.scrubTokens))
 	}
 	defer res.Body.Close()
 
@@ -377,8 +406,8 @@ func (c *client) httpError(res *http.Response, body []byte) error {
 	}
 	var env apiErrorEnvelope
 	_ = json.Unmarshal(body, &env)
-	code := clipText(scrubSecret(strings.TrimSpace(env.Error.Code), c.token), 64)
-	msg := clipText(scrubSecret(strings.TrimSpace(env.Error.Message), c.token), 300)
+	code := clipText(scrubSecrets(strings.TrimSpace(env.Error.Code), c.scrubTokens), 64)
+	msg := clipText(scrubSecrets(strings.TrimSpace(env.Error.Message), c.scrubTokens), 300)
 
 	switch res.StatusCode {
 	case http.StatusBadRequest:
@@ -413,12 +442,25 @@ func (c *client) httpError(res *http.Response, body []byte) error {
 	}
 }
 
-func sanitizeNetError(err error, token string) string {
+func sanitizeNetError(err error, tokens []string) string {
 	var uerr *url.Error
 	if errors.As(err, &uerr) && uerr.Err != nil {
-		return clipText(scrubSecret(uerr.Err.Error(), token), 200)
+		return clipText(scrubSecrets(uerr.Err.Error(), tokens), 200)
 	}
-	return clipText(scrubSecret(err.Error(), token), 200)
+	return clipText(scrubSecrets(err.Error(), tokens), 200)
+}
+
+func scrubSecrets(text string, tokens []string) string {
+	if text == "" || len(tokens) == 0 {
+		return text
+	}
+	out := text
+	for _, tok := range tokens {
+		if tok != "" {
+			out = strings.ReplaceAll(out, tok, "[redacted]")
+		}
+	}
+	return out
 }
 
 func scrubSecret(text, token string) string {
