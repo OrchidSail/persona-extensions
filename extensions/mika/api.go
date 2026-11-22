@@ -37,9 +37,9 @@ const (
 )
 
 var (
-	errNotConfigured   = errors.New("Mika instance URL and api_token must be configured in Settings › Extensions")
+	errNotConfigured   = errors.New("no Mika device is configured; open the Mika page to add an Android phone")
 	errInvalidArgument = errors.New("Mika rejected the request")
-	errUnauthorized    = errors.New("Mika rejected the access token (401); check api_token in extension settings")
+	errUnauthorized    = errors.New("Mika rejected the access token (401); check the device token on the Mika page")
 	errForbidden       = errors.New("Mika denied access (403)")
 	errNotFound        = errors.New("Mika could not find that task or endpoint (404)")
 	errConflict        = errors.New("Mika rejected the action for the current task state (409)")

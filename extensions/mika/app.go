@@ -72,10 +72,12 @@ var deviceSlots = []slotSpec{
 }
 
 type deviceEntry struct {
-	slot        string
+	id          string
 	index       int
 	name        string
+	rawURL      string
 	maskedURL   string
+	defaultDev  bool
 	configState string
 	configErr   string
 	client      *client
@@ -85,16 +87,22 @@ func (d deviceEntry) ready() bool {
 	return d.configState == deviceStateReady && d.client != nil && d.client.configured()
 }
 
-func (d deviceEntry) isPrimary() bool {
-	return d.slot == slotPrimary
+func (d deviceEntry) isDefault() bool {
+	return d.defaultDev
 }
 
 func (d deviceEntry) label() string {
-	return fmt.Sprintf("%s (%s)", d.name, d.slot)
+	if d.defaultDev {
+		return fmt.Sprintf("%s (#%d, default)", d.name, d.index)
+	}
+	return fmt.Sprintf("%s (#%d)", d.name, d.index)
 }
 
 func (d deviceEntry) confirmLabel() string {
-	return fmt.Sprintf("%s (%s, %s)", d.name, d.slot, d.maskedURL)
+	if d.defaultDev {
+		return fmt.Sprintf("%s (default, %s)", d.name, d.maskedURL)
+	}
+	return fmt.Sprintf("%s (#%d, %s)", d.name, d.index, d.maskedURL)
 }
 
 type deviceHealth struct {
@@ -103,26 +111,28 @@ type deviceHealth struct {
 }
 
 type app struct {
-	mu          sync.RWMutex
-	devices     []deviceEntry
-	allTokens   []string
-	defaultWait int
-	hub         hubNotifier
-	receipts    *writeStore
-	health      map[string]deviceHealth
-}
-
-type hubNotifier interface {
-	Invalidate(string) error
+	mu               sync.RWMutex
+	vaultMu          sync.Mutex
+	stored           []storedDevice
+	migratedLegacy   bool
+	retiredTokens    []string
+	devices          []deviceEntry
+	allTokens        []string
+	defaultWait      int
+	skipConfirmation bool // zero-value safe: false means write tools require confirmation via actions.list
+	hub              hubClient
+	receipts         *writeStore
+	health           map[string]deviceHealth
 }
 
 type appState struct {
-	devices     []deviceEntry
-	allTokens   []string
-	defaultWait int
-	hub         hubNotifier
-	receipts    *writeStore
-	health      map[string]deviceHealth
+	devices          []deviceEntry
+	allTokens        []string
+	defaultWait      int
+	skipConfirmation bool
+	hub              hubClient
+	receipts         *writeStore
+	health           map[string]deviceHealth
 }
 
 func newApp() *app {
@@ -145,12 +155,13 @@ func (a *app) snapshot() appState {
 		healthCopy[k] = v
 	}
 	return appState{
-		devices:     slices.Clone(a.devices),
-		allTokens:   slices.Clone(a.allTokens),
-		defaultWait: wait,
-		hub:         a.hub,
-		receipts:    a.receipts,
-		health:      healthCopy,
+		devices:          slices.Clone(a.devices),
+		allTokens:        slices.Clone(a.allTokens),
+		defaultWait:      wait,
+		skipConfirmation: a.skipConfirmation,
+		hub:              a.hub,
+		receipts:         a.receipts,
+		health:           healthCopy,
 	}
 }
 
@@ -172,9 +183,21 @@ func (st appState) readyDevices() []deviceEntry {
 	return out
 }
 
-func (st appState) deviceBySlot(slot string) (deviceEntry, bool) {
+func (st appState) defaultDevice() (deviceEntry, bool) {
 	for _, d := range st.devices {
-		if d.slot == slot {
+		if d.defaultDev {
+			return d, true
+		}
+	}
+	if len(st.devices) > 0 {
+		return st.devices[0], true
+	}
+	return deviceEntry{}, false
+}
+
+func (st appState) deviceByID(id string) (deviceEntry, bool) {
+	for _, d := range st.devices {
+		if d.id == id {
 			return d, true
 		}
 	}
@@ -203,7 +226,7 @@ func (st appState) availableDevicesSummary() string {
 	}
 	parts := make([]string, 0, len(st.devices))
 	for _, d := range st.devices {
-		s := fmt.Sprintf("%s (%s)", d.name, d.slot)
+		s := d.label()
 		if !d.ready() {
 			s += " [" + d.configState + "]"
 		}
@@ -241,8 +264,12 @@ func normalizeDeviceName(raw, fallback string) (string, error) {
 	return trimmed, nil
 }
 
-// resolveDevice finds a configured device by optional selector (empty -> primary slot 1,
-// else case-insensitive match against custom name or slot aliases primary/secondary/tertiary/1/2/3).
+// resolveDevice finds a configured device by optional selector:
+// empty / "default" / "primary" -> default device (#1);
+// case-insensitive match against device name;
+// backward-compatible legacy slot aliases ("secondary" -> #2, "tertiary" -> #3);
+// 1-based index ("1" -> default device #1, "2" -> #2, ...);
+// or exact device ID.
 func (st appState) resolveDevice(rawSelector string) (deviceEntry, error) {
 	sel, err := validDeviceSelector(rawSelector)
 	if err != nil {
@@ -251,36 +278,48 @@ func (st appState) resolveDevice(rawSelector string) (deviceEntry, error) {
 	if len(st.devices) == 0 {
 		return deviceEntry{}, errNotConfigured
 	}
-	if sel == "" {
-		if primary, ok := st.deviceBySlot(slotPrimary); ok {
-			return primary, nil
+	if sel == "" || strings.EqualFold(sel, "default") || strings.EqualFold(sel, slotPrimary) {
+		if def, ok := st.defaultDevice(); ok {
+			return def, nil
 		}
-		return deviceEntry{}, fmt.Errorf("%w: primary device (slot 1) is not configured; available devices: %s",
-			errNotConfigured, st.availableDevicesSummary())
+		return deviceEntry{}, errNotConfigured
 	}
 
-	var matches []deviceEntry
+	var nameMatches []deviceEntry
 	for _, d := range st.devices {
-		matchesName := strings.EqualFold(d.name, sel)
-		matchesSlot := strings.EqualFold(d.slot, sel) || sel == strconv.Itoa(d.index)
-		if matchesName || matchesSlot {
-			matches = append(matches, d)
+		if strings.EqualFold(d.name, sel) {
+			nameMatches = append(nameMatches, d)
 		}
 	}
-	switch len(matches) {
-	case 1:
-		return matches[0], nil
-	case 0:
-		return deviceEntry{}, fmt.Errorf("unknown Mika device %q; available devices: %s (you can match by device name, primary/secondary/tertiary, or 1/2/3)",
-			st.scrub(sel), st.availableDevicesSummary())
-	default:
-		labels := make([]string, 0, len(matches))
-		for _, m := range matches {
-			labels = append(labels, fmt.Sprintf("%s [%s / %d]", m.name, m.slot, m.index))
-		}
-		return deviceEntry{}, fmt.Errorf("ambiguous Mika device %q matches multiple slots (%s); use a slot alias (primary/secondary/tertiary or 1/2/3) or give each phone a unique name in Settings › Extensions. Available devices: %s",
-			st.scrub(sel), strings.Join(labels, ", "), st.availableDevicesSummary())
+	if len(nameMatches) == 1 {
+		return nameMatches[0], nil
 	}
+	if len(nameMatches) > 1 {
+		labels := make([]string, 0, len(nameMatches))
+		for _, m := range nameMatches {
+			labels = append(labels, fmt.Sprintf("%s [#%d]", m.name, m.index))
+		}
+		return deviceEntry{}, fmt.Errorf("ambiguous Mika device %q matches multiple devices (%s); use a 1-based index (1..%d) or give each phone a unique name on the Mika page. Available devices: %s",
+			st.scrub(sel), strings.Join(labels, ", "), len(st.devices), st.availableDevicesSummary())
+	}
+
+	if strings.EqualFold(sel, slotSecondary) && len(st.devices) >= 2 {
+		return st.devices[1], nil
+	}
+	if strings.EqualFold(sel, slotTertiary) && len(st.devices) >= 3 {
+		return st.devices[2], nil
+	}
+
+	if n, err := strconv.Atoi(sel); err == nil && n >= 1 && n <= len(st.devices) {
+		return st.devices[n-1], nil
+	}
+
+	if d, ok := st.deviceByID(sel); ok {
+		return d, nil
+	}
+
+	return deviceEntry{}, fmt.Errorf("unknown Mika device %q; available devices: %s (match by device name, default/primary, or 1-based index 1..%d)",
+		st.scrub(sel), st.availableDevicesSummary(), len(st.devices))
 }
 
 func (st appState) resolveReadyDevice(rawSelector string) (deviceEntry, error) {
@@ -307,19 +346,24 @@ func (st appState) resolveReadyDevice(rawSelector string) (deviceEntry, error) {
 	return dev, nil
 }
 
-func isValidSlot(slot string) bool {
-	return slot == slotPrimary || slot == slotSecondary || slot == slotTertiary
+func (a *app) init(ctx context.Context, in *ext.Init, hub *ext.Hub) (map[string]any, error) {
+	var hc hubClient
+	if hub != nil {
+		hc = hub
+	}
+	return a.initWithHub(ctx, in, hc)
 }
 
-func (a *app) init(_ context.Context, in *ext.Init, hub *ext.Hub) (map[string]any, error) {
+func (a *app) initWithHub(ctx context.Context, in *ext.Init, hub hubClient) (map[string]any, error) {
 	var cfg struct {
-		InstanceName       string `json:"instance_name"`
-		InstanceURL        string `json:"instance_url"`
-		SecondaryName      string `json:"secondary_name"`
-		SecondaryURL       string `json:"secondary_url"`
-		TertiaryName       string `json:"tertiary_name"`
-		TertiaryURL        string `json:"tertiary_url"`
-		DefaultWaitSeconds int    `json:"default_wait_seconds"`
+		DefaultWaitSeconds  int    `json:"default_wait_seconds"`
+		RequireConfirmation *bool  `json:"require_confirmation"`
+		InstanceName        string `json:"instance_name"`
+		InstanceURL         string `json:"instance_url"`
+		SecondaryName       string `json:"secondary_name"`
+		SecondaryURL        string `json:"secondary_url"`
+		TertiaryName        string `json:"tertiary_name"`
+		TertiaryURL         string `json:"tertiary_url"`
 	}
 	if err := in.Config(&cfg); err != nil {
 		return nil, err
@@ -332,102 +376,74 @@ func (a *app) init(_ context.Context, in *ext.Init, hub *ext.Hub) (map[string]an
 		return nil, fmt.Errorf("default_wait_seconds must be between %d and %d", minWaitSeconds, maxWaitSeconds)
 	}
 
-	rawInputs := []struct {
-		spec  slotSpec
-		name  string
-		url   string
-		token string
-	}{
-		{deviceSlots[0], cfg.InstanceName, cfg.InstanceURL, in.Secrets[deviceSlots[0].secretField]},
-		{deviceSlots[1], cfg.SecondaryName, cfg.SecondaryURL, in.Secrets[deviceSlots[1].secretField]},
-		{deviceSlots[2], cfg.TertiaryName, cfg.TertiaryURL, in.Secrets[deviceSlots[2].secretField]},
-	}
+	// Zero-value safe: require confirmation unless require_confirmation is explicitly false.
+	skipConfirmation := cfg.RequireConfirmation != nil && !*cfg.RequireConfirmation
 
-	// Collect all configured secrets upfront so any error from any slot scrubs every token.
-	var tokenList []string
-	for _, r := range rawInputs {
-		if tok := strings.TrimSpace(r.token); tok != "" {
-			tokenList = append(tokenList, tok)
+	// Collect all legacy secrets upfront so any error during vault loading or migration scrubs every token.
+	var legacySecretValues []string
+	for _, tok := range in.Secrets {
+		if trimmed := strings.TrimSpace(tok); trimmed != "" {
+			legacySecretValues = append(legacySecretValues, trimmed)
 		}
 	}
-	allTokens := collectScrubTokens("", tokenList...)
+	legacyTokens := collectScrubTokens("", legacySecretValues...)
 
 	var (
-		devices       []deviceEntry
-		readyCount    int
-		firstFatalErr string
+		stored         []storedDevice
+		migratedLegacy bool
 	)
-	for _, r := range rawInputs {
-		rawName := strings.TrimSpace(r.name)
-		rawURL := strings.TrimSpace(r.url)
-		rawToken := strings.TrimSpace(r.token)
-
-		// Treat untouched optional slots (and empty primary with only default name) as absent.
-		touched := rawURL != "" || rawToken != ""
-		if !touched {
-			if r.spec.slot == slotPrimary {
-				touched = rawName != "" && !strings.EqualFold(rawName, r.spec.defaultName)
-			} else {
-				touched = rawName != ""
+	if hub != nil {
+		loadCtx, cancel := context.WithTimeout(ctx, vaultRPCTimeout)
+		rawVault, err := hub.LoadSecret(loadCtx, connectorID)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("could not load encrypted Mika devices from hub: %s", scrubSecrets(err.Error(), legacyTokens))
+		}
+		if len(rawVault) > 0 {
+			vault, err := decodeDeviceVault(rawVault, legacyTokens)
+			if err != nil {
+				return nil, err
 			}
+			stored = vault.Devices
+			migratedLegacy = vault.MigratedLegacy
 		}
-		if !touched {
-			continue
-		}
-
-		entry := deviceEntry{
-			slot:      r.spec.slot,
-			index:     r.spec.index,
-			name:      r.spec.defaultName,
-			maskedURL: "(not set)",
-		}
-
-		name, nameErr := normalizeDeviceName(rawName, r.spec.defaultName)
-		if nameErr != nil {
-			entry.configState = deviceStateInvalidName
-			entry.configErr = fmt.Sprintf("%s: %s", r.spec.nameField, scrubSecrets(nameErr.Error(), allTokens))
-			if firstFatalErr == "" {
-				firstFatalErr = entry.configErr
-			}
-			devices = append(devices, entry)
-			continue
-		}
-		entry.name = name
-
-		switch {
-		case rawURL == "" && rawToken == "":
-			entry.configState = deviceStateNotConfigured
-			entry.configErr = fmt.Sprintf("%s and %s are not configured in Settings › Extensions", r.spec.urlField, r.spec.secretField)
-		case rawURL == "" && rawToken != "":
-			entry.configState = deviceStateMissingURL
-			entry.configErr = fmt.Sprintf("%s is not configured in Settings › Extensions", r.spec.urlField)
-		default:
-			base, urlErr := normalizeInstanceURL(rawURL)
-			if urlErr != nil {
-				entry.configState = deviceStateInvalidURL
-				entry.maskedURL = "(invalid URL)"
-				entry.configErr = fmt.Sprintf("%s: %s", r.spec.urlField, scrubSecrets(urlErr.Error(), allTokens))
-				if firstFatalErr == "" {
-					firstFatalErr = entry.configErr
-				}
-			} else {
-				entry.maskedURL = maskInstanceURL(base)
-				if rawToken == "" {
-					entry.configState = deviceStateMissingToken
-					entry.configErr = fmt.Sprintf("%s is not configured in Settings › Extensions", r.spec.secretField)
-				} else {
-					entry.configState = deviceStateReady
-					entry.client = newClient(base, rawToken, allTokens...)
-					readyCount++
-				}
-			}
-		}
-		devices = append(devices, entry)
 	}
 
-	// Fail fast on invalid URL/name only when no device is ready; otherwise isolate the bad slot.
-	if readyCount == 0 && firstFatalErr != "" {
-		return nil, errors.New(firstFatalErr)
+	// Zero-loss automatic migration from 0.1.0 / 0.2.x 3-slot config & secrets into Hub encrypted vault.
+	if len(stored) == 0 && !migratedLegacy {
+		legacyCfg := legacySlotsConfig{
+			InstanceName:  cfg.InstanceName,
+			InstanceURL:   cfg.InstanceURL,
+			SecondaryName: cfg.SecondaryName,
+			SecondaryURL:  cfg.SecondaryURL,
+			TertiaryName:  cfg.TertiaryName,
+			TertiaryURL:   cfg.TertiaryURL,
+		}
+		migrated, _, err := migrateLegacySlots(legacyCfg, in.Secrets, legacyTokens)
+		if err != nil {
+			return nil, err
+		}
+		if len(migrated) > 0 {
+			stored = migrated
+			migratedLegacy = true
+			if hub != nil {
+				encoded, err := encodeDeviceVault(deviceVault{
+					Version:        vaultSchemaVersion,
+					MigratedLegacy: true,
+					Devices:        stored,
+				})
+				if err != nil {
+					return nil, errors.New(scrubSecrets(err.Error(), collectVaultTokens(stored, legacyTokens...)))
+				}
+				saveCtx, cancel := context.WithTimeout(ctx, vaultRPCTimeout)
+				saveErr := hub.SaveSecret(saveCtx, connectorID, encoded)
+				cancel()
+				if saveErr != nil {
+					return nil, fmt.Errorf("could not persist migrated Mika devices to hub: %s",
+						scrubSecrets(saveErr.Error(), collectVaultTokens(stored, legacyTokens...)))
+				}
+			}
+		}
 	}
 
 	store, err := openWriteStore(in.Info().DataDir)
@@ -435,35 +451,38 @@ func (a *app) init(_ context.Context, in *ext.Init, hub *ext.Hub) (map[string]an
 		return nil, err
 	}
 
+	allTokens := collectVaultTokens(stored, legacyTokens...)
+	devices := buildDeviceEntries(stored, allTokens)
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.stored = slices.Clone(stored)
+	a.migratedLegacy = migratedLegacy
+	a.retiredTokens = slices.Clone(legacyTokens)
 	a.devices = devices
 	a.allTokens = allTokens
 	a.defaultWait = wait
-	if hub != nil {
-		a.hub = hub
-	} else {
-		a.hub = nil
-	}
+	a.skipConfirmation = skipConfirmation
+	a.hub = hub
 	a.receipts = store
 	a.health = map[string]deviceHealth{}
 	return nil, nil
 }
 
-func (a *app) recordDevice(slot string, err error) {
+func (a *app) recordDevice(deviceID string, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.health == nil {
 		a.health = map[string]deviceHealth{}
 	}
-	h := a.health[slot]
+	h := a.health[deviceID]
 	if err == nil {
 		h.lastOK = time.Now().UTC()
 		h.lastErr = nil
 	} else {
 		h.lastErr = err
 	}
-	a.health[slot] = h
+	a.health[deviceID] = h
 }
 
 func (a *app) status() map[string]any {
@@ -502,7 +521,7 @@ func (a *app) status() map[string]any {
 		for _, d := range a.devices {
 			names = append(names, d.name)
 		}
-		account = fmt.Sprintf("Mika (%s)", strings.Join(names, ", "))
+		account = fmt.Sprintf("Mika (%s)", clipText(strings.Join(names, ", "), 120))
 	}
 
 	if len(ready) == 0 {
@@ -514,13 +533,13 @@ func (a *app) status() map[string]any {
 	}
 
 	var (
-		latestOK     time.Time
-		healthyReady int
-		firstErr     error
-		firstErrSlot string
+		latestOK      time.Time
+		healthyReady  int
+		firstErr      error
+		firstErrLabel string
 	)
 	for _, d := range ready {
-		h := a.health[d.slot]
+		h := a.health[d.id]
 		if h.lastOK.After(latestOK) {
 			latestOK = h.lastOK
 		}
@@ -528,7 +547,7 @@ func (a *app) status() map[string]any {
 			healthyReady++
 		} else if firstErr == nil {
 			firstErr = h.lastErr
-			firstErrSlot = d.label()
+			firstErrLabel = d.label()
 		}
 	}
 
@@ -542,8 +561,8 @@ func (a *app) status() map[string]any {
 	// so the hub keeps offering tools for the healthy device(s) (per connector.schema.json).
 	if healthyReady == 0 && firstErr != nil {
 		msg := scrubSecrets(firstErr.Error(), a.allTokens)
-		if len(a.devices) > 1 && firstErrSlot != "" {
-			msg = firstErrSlot + ": " + msg
+		if len(a.devices) > 1 && firstErrLabel != "" {
+			msg = firstErrLabel + ": " + msg
 		}
 		out["error"] = clipText(msg, 200)
 		switch {
@@ -577,6 +596,10 @@ func (a *app) connector(ctx context.Context, method string, raw json.RawMessage)
 	case "status":
 		return a.status(), nil
 	case "tools.list":
+		st := a.snapshot()
+		if st.skipConfirmation {
+			return map[string]any{"tools": allDirectTools()}, nil
+		}
 		return map[string]any{"tools": readTools}, nil
 	case "tools.call":
 		timeout := 30 * time.Second
@@ -585,12 +608,26 @@ func (a *app) connector(ctx context.Context, method string, raw json.RawMessage)
 		}
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		if isWriteTool(in.Name) {
+			if !a.snapshot().skipConfirmation {
+				return nil, fmt.Errorf("tool %s requires confirmation via actions.do while require_confirmation is enabled", in.Name)
+			}
+			text, err := a.callWriteTool(ctx, in.Name, in.Args)
+			if err != nil {
+				return nil, mapConnectorError(err)
+			}
+			return map[string]any{"text": text}, nil
+		}
 		text, err := a.callTool(ctx, in.Name, in.Args)
 		if err != nil {
 			return nil, mapConnectorError(err)
 		}
 		return map[string]any{"text": text}, nil
 	case "actions.list":
+		st := a.snapshot()
+		if st.skipConfirmation {
+			return map[string]any{"tools": []tool{}}, nil
+		}
 		return map[string]any{"tools": actionTools}, nil
 	case "actions.describe":
 		return a.describeAction(in.Name, in.Args)

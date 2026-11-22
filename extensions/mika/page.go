@@ -16,12 +16,16 @@ import (
 )
 
 const (
-	pageBatchSize     = 20
-	maxOverviewPages  = 5
-	maxViewTasks      = 100
-	maxDetailItems    = 240
-	peerProbeTimeout  = 5 * time.Second
-	maxSegmentedLabel = 12
+	pageBatchSize        = 20
+	maxOverviewPages     = 5
+	maxViewTasks         = 100
+	maxDetailItems       = 240
+	peerProbeTimeout     = 5 * time.Second
+	doctorActionTimeout  = 8 * time.Second
+	maxProbeConcurrency  = 8
+	maxSegmentedDevices  = 5
+	maxSegmentedLabel    = 12
+	maxOverviewTaskItems = 200
 )
 
 type pageState struct {
@@ -36,14 +40,16 @@ func readState(r *ext.UIRequest) (pageState, error) {
 	if err := r.DecodeState(&st); err != nil || st.Pages < 0 || st.Pages > maxOverviewPages || len(st.TaskID) > 128 {
 		return pageState{}, errors.New("invalid page state")
 	}
-	if st.Mode != "" && st.Mode != "overview" && st.Mode != "detail" {
+	switch st.Mode {
+	case "", "overview", "detail", "add_device", "device_edit":
+	default:
 		return pageState{}, errors.New("invalid page mode")
 	}
 	if st.TaskID != "" && validTaskID(st.TaskID) != nil {
 		return pageState{}, errors.New("invalid task_id in page state")
 	}
-	if st.Device != "" && !isValidSlot(st.Device) {
-		return pageState{}, errors.New("invalid device slot in page state")
+	if st.Device != "" && !validDeviceID(st.Device) {
+		return pageState{}, errors.New("invalid device id in page state")
 	}
 	return st, nil
 }
@@ -56,34 +62,198 @@ func (a *app) render(ctx context.Context, r *ext.UIRequest) (*wire.View, error) 
 	return a.page(ctx, r, st)
 }
 
+func resolvePageDeviceID(snap appState, raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	if d, ok := snap.deviceByID(raw); ok {
+		return d.id, true
+	}
+	if d, err := snap.resolveDevice(raw); err == nil {
+		return d.id, true
+	}
+	return "", false
+}
+
 func (a *app) action(ctx context.Context, r *ext.UIRequest) (*wire.ActionResult, error) {
 	st, err := readState(r)
 	if err != nil {
 		return nil, err
 	}
+	t := textsFor(r.Locale)
+	snap := a.snapshot()
+
 	switch {
 	case r.Action == "refresh":
 		// Keep current mode, device, and task selection while re-fetching fresh state.
-	case r.Action == "device" || strings.HasPrefix(r.Action, "device:"):
-		var slot string
-		if strings.HasPrefix(r.Action, "device:") {
-			slot = strings.TrimSpace(strings.TrimPrefix(r.Action, "device:"))
+
+	case r.Action == "add_device":
+		st.Mode = "add_device"
+		st.TaskID = ""
+
+	case r.Action == "edit" || strings.HasPrefix(r.Action, "edit:"):
+		id := strings.TrimSpace(strings.TrimPrefix(r.Action, "edit:"))
+		if r.Action == "edit" || id == "" {
+			id = strings.TrimSpace(r.Values["device"])
 		}
-		if slot == "" {
-			slot = strings.TrimSpace(r.Values["device"])
+		if id == "" {
+			id = st.Device
 		}
-		if !isValidSlot(slot) && slot != "" {
-			if d, derr := a.snapshot().resolveDevice(slot); derr == nil {
-				slot = d.slot
-			}
+		resolvedID, ok := resolvePageDeviceID(snap, id)
+		if !ok {
+			return &wire.ActionResult{Toast: t.deviceNotFound}, nil
 		}
-		if !isValidSlot(slot) {
-			return nil, fmt.Errorf("invalid device slot %q", slot)
+		st.Mode = "device_edit"
+		st.Device = resolvedID
+		st.TaskID = ""
+
+	case r.Action == "save_add":
+		name := r.Values["name"]
+		rawURL := r.Values["url"]
+		token := r.Values["token"]
+		makeDefault := parseBoolValue(r.Values["default"])
+		dev, addErr := a.addDevice(ctx, name, rawURL, token, makeDefault)
+		if addErr != nil {
+			scrubbed := scrubSecrets(addErr.Error(), collectScrubTokens(token, a.snapshot().allTokens...))
+			return &wire.ActionResult{Toast: clipText(scrubbed, 300)}, nil
 		}
-		st.Device = slot
+		return &wire.ActionResult{
+			Toast: fmt.Sprintf(t.deviceAddedFmt, dev.name),
+			Pop:   true,
+		}, nil
+
+	case r.Action == "save_edit" || strings.HasPrefix(r.Action, "save_edit:"):
+		id := ""
+		if strings.HasPrefix(r.Action, "save_edit:") {
+			id = strings.TrimSpace(strings.TrimPrefix(r.Action, "save_edit:"))
+		}
+		if id == "" {
+			id = st.Device
+		}
+		if id == "" {
+			id = strings.TrimSpace(r.Values["device"])
+		}
+		if !validDeviceID(id) {
+			return &wire.ActionResult{Toast: t.deviceNotFound}, nil
+		}
+		name := r.Values["name"]
+		rawURL := r.Values["url"]
+		token := r.Values["token"]
+		makeDefault := parseBoolValue(r.Values["default"])
+		dev, editErr := a.editDevice(ctx, id, name, rawURL, token, makeDefault)
+		if editErr != nil {
+			scrubbed := scrubSecrets(editErr.Error(), collectScrubTokens(token, a.snapshot().allTokens...))
+			return &wire.ActionResult{Toast: clipText(scrubbed, 300)}, nil
+		}
+		return &wire.ActionResult{
+			Toast: fmt.Sprintf(t.deviceSavedFmt, dev.name),
+			Pop:   true,
+		}, nil
+
+	case r.Action == "set_default" || strings.HasPrefix(r.Action, "set_default:"):
+		id := ""
+		if strings.HasPrefix(r.Action, "set_default:") {
+			id = strings.TrimSpace(strings.TrimPrefix(r.Action, "set_default:"))
+		}
+		if id == "" {
+			id = strings.TrimSpace(r.Values["device"])
+		}
+		if id == "" {
+			id = st.Device
+		}
+		dev, defErr := a.setDefaultDevice(ctx, id)
+		if defErr != nil {
+			return &wire.ActionResult{Toast: clipText(a.snapshot().scrub(defErr.Error()), 300)}, nil
+		}
+		st.Device = dev.id
 		st.Mode = "overview"
 		st.TaskID = ""
 		st.Pages = 1
+		v, perr := a.page(ctx, r, st)
+		if perr != nil {
+			return nil, perr
+		}
+		return &wire.ActionResult{
+			View:  v,
+			Toast: fmt.Sprintf(t.deviceDefaultFmt, dev.name),
+		}, nil
+
+	case r.Action == "test" || strings.HasPrefix(r.Action, "test:"):
+		id := ""
+		if strings.HasPrefix(r.Action, "test:") {
+			id = strings.TrimSpace(strings.TrimPrefix(r.Action, "test:"))
+		}
+		if id == "" {
+			id = strings.TrimSpace(r.Values["device"])
+		}
+		if id == "" {
+			id = st.Device
+		}
+		resolvedID, ok := resolvePageDeviceID(snap, id)
+		if !ok {
+			return &wire.ActionResult{Toast: t.deviceNotFound}, nil
+		}
+		dev, _ := snap.deviceByID(resolvedID)
+		toast := a.testDeviceConn(ctx, dev, snap, t)
+		if st.Mode == "device_edit" {
+			return &wire.ActionResult{Toast: clipText(toast, 300)}, nil
+		}
+		if st.Device == "" {
+			st.Device = dev.id
+		}
+		v, perr := a.page(ctx, r, st)
+		if perr != nil {
+			return nil, perr
+		}
+		return &wire.ActionResult{View: v, Toast: clipText(toast, 300)}, nil
+
+	case r.Action == "delete" || strings.HasPrefix(r.Action, "delete:"):
+		id := ""
+		if strings.HasPrefix(r.Action, "delete:") {
+			id = strings.TrimSpace(strings.TrimPrefix(r.Action, "delete:"))
+		}
+		if id == "" {
+			id = strings.TrimSpace(r.Values["device"])
+		}
+		if id == "" {
+			id = st.Device
+		}
+		removedName, nextID, delErr := a.deleteDevice(ctx, id)
+		if delErr != nil {
+			return &wire.ActionResult{Toast: clipText(a.snapshot().scrub(delErr.Error()), 300)}, nil
+		}
+		toast := fmt.Sprintf(t.deviceDeletedFmt, removedName)
+		if st.Mode == "device_edit" {
+			return &wire.ActionResult{Toast: toast, Pop: true}, nil
+		}
+		st.Device = nextID
+		st.Mode = "overview"
+		st.TaskID = ""
+		st.Pages = 1
+		v, perr := a.page(ctx, r, st)
+		if perr != nil {
+			return nil, perr
+		}
+		return &wire.ActionResult{View: v, Toast: toast}, nil
+
+	case r.Action == "device" || strings.HasPrefix(r.Action, "device:"):
+		var rawID string
+		if strings.HasPrefix(r.Action, "device:") {
+			rawID = strings.TrimSpace(strings.TrimPrefix(r.Action, "device:"))
+		}
+		if rawID == "" {
+			rawID = strings.TrimSpace(r.Values["device"])
+		}
+		resolvedID, ok := resolvePageDeviceID(snap, rawID)
+		if !ok {
+			return nil, fmt.Errorf("unknown device %q", snap.scrub(rawID))
+		}
+		st.Device = resolvedID
+		st.Mode = "overview"
+		st.TaskID = ""
+		st.Pages = 1
+
 	case r.Action == "more":
 		if st.Pages < 1 {
 			st.Pages = 1
@@ -92,12 +262,13 @@ func (a *app) action(ctx context.Context, r *ext.UIRequest) (*wire.ActionResult,
 			st.Pages++
 		}
 		st.Mode = "overview"
+
 	case r.Action == "detail" || strings.HasPrefix(r.Action, "detail:"):
-		var id, devSlot string
+		var id, devID string
 		if strings.HasPrefix(r.Action, "detail:") {
 			rest := strings.TrimPrefix(r.Action, "detail:")
-			if pSlot, pID, ok := strings.Cut(rest, ":"); ok && isValidSlot(pSlot) && pID != "" {
-				devSlot = pSlot
+			if pDev, pID, ok := strings.Cut(rest, ":"); ok && validDeviceID(pDev) && pID != "" {
+				devID = pDev
 				id = pID
 			} else {
 				id = strings.TrimSpace(rest)
@@ -106,29 +277,28 @@ func (a *app) action(ctx context.Context, r *ext.UIRequest) (*wire.ActionResult,
 		if id == "" {
 			id = strings.TrimSpace(r.Values["task_id"])
 		}
-		if devSlot == "" {
-			devSlot = strings.TrimSpace(r.Values["device"])
+		if devID == "" {
+			devID = strings.TrimSpace(r.Values["device"])
 		}
 		if err := validTaskID(id); err != nil {
 			return nil, err
 		}
-		if devSlot != "" {
-			if !isValidSlot(devSlot) {
-				if d, derr := a.snapshot().resolveDevice(devSlot); derr == nil {
-					devSlot = d.slot
-				}
+		if devID != "" {
+			resolvedID, ok := resolvePageDeviceID(snap, devID)
+			if !ok {
+				return nil, fmt.Errorf("unknown device %q", snap.scrub(devID))
 			}
-			if !isValidSlot(devSlot) {
-				return nil, fmt.Errorf("invalid device slot %q", devSlot)
-			}
-			st.Device = devSlot
+			st.Device = resolvedID
 		}
 		st.Mode, st.TaskID = "detail", id
+
 	case r.Action == "back":
 		st.Mode, st.TaskID = "overview", ""
+
 	default:
 		return nil, fmt.Errorf("unknown page action %q", r.Action)
 	}
+
 	v, err := a.page(ctx, r, st)
 	if err != nil {
 		return nil, err
@@ -136,17 +306,50 @@ func (a *app) action(ctx context.Context, r *ext.UIRequest) (*wire.ActionResult,
 	return &wire.ActionResult{View: v}, nil
 }
 
-func selectPageDevice(snap appState, requestedSlot string) (deviceEntry, bool) {
+func (a *app) testDeviceConn(ctx context.Context, dev deviceEntry, snap appState, t *texts) string {
+	if !dev.ready() {
+		reason := snap.scrub(dev.configErr)
+		if reason == "" {
+			reason = t.notConfigured
+		}
+		return fmt.Sprintf(t.testFailFmt, dev.name, reason)
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, doctorActionTimeout)
+	defer cancel()
+	info, err := dev.client.discover(probeCtx)
+	a.recordDevice(dev.id, err)
+	if err != nil {
+		return fmt.Sprintf(t.testFailFmt, dev.name, snap.scrub(err.Error()))
+	}
+	phoneStatus := t.ready
+	if slices.Contains(info.Capabilities, "device_state") {
+		if ds, derr := dev.client.deviceState(probeCtx); derr == nil && ds.Device != nil {
+			switch {
+			case !ds.Device.HelperAvailable:
+				phoneStatus = t.helperOffline
+			case ds.Device.Ready:
+				phoneStatus = t.ready
+			default:
+				phoneStatus = t.locked
+			}
+		} else {
+			phoneStatus = t.deviceUnavailable
+		}
+	}
+	return fmt.Sprintf(t.testOKFmt, dev.name, formatVersionLabel(info), phoneStatus)
+}
+
+func selectPageDevice(snap appState, requestedID string) (deviceEntry, bool) {
 	if len(snap.devices) == 0 {
 		return deviceEntry{}, false
 	}
-	if requestedSlot != "" {
-		if d, ok := snap.deviceBySlot(requestedSlot); ok {
+	if requestedID != "" {
+		if d, ok := snap.deviceByID(requestedID); ok {
 			return d, true
 		}
 	}
-	if primary, ok := snap.deviceBySlot(slotPrimary); ok && primary.ready() {
-		return primary, true
+	if def, ok := snap.defaultDevice(); ok && def.ready() {
+		return def, true
 	}
 	for _, d := range snap.devices {
 		if d.ready() {
@@ -159,27 +362,226 @@ func selectPageDevice(snap appState, requestedSlot string) (deviceEntry, bool) {
 func (a *app) page(ctx context.Context, r *ext.UIRequest, st pageState) (*wire.View, error) {
 	t := textsFor(r.Locale)
 	snap := a.snapshot()
+
+	if st.Mode == "add_device" {
+		return a.addDeviceView(r, snap, t), nil
+	}
+	if st.Mode == "device_edit" {
+		return a.editDeviceView(r, st, snap, t), nil
+	}
+
 	sel, ok := selectPageDevice(snap, st.Device)
-	if !ok || (!snap.isMultiDevice() && sel.configState == deviceStateNotConfigured) {
+	if !ok {
 		return &wire.View{
 			Title: t.title,
 			Sections: []wire.Section{{
 				Items: []wire.Component{{
-					Type:  wire.ComponentEmpty,
-					Title: t.notConfigured,
+					Type:   wire.ComponentEmpty,
+					Key:    "mika-empty",
+					Title:  t.noDevicesTitle,
+					Detail: t.noDevicesDetail,
+					Icon:   wire.NavIconExtension,
+					Button: &wire.EmptyButton{
+						Title:  t.addDeviceBtn,
+						Action: *ext.Open("add_device", "", pageState{Mode: "add_device"}, t.addDeviceTitle),
+					},
 				}},
 			}},
 		}, nil
 	}
-	if snap.isMultiDevice() {
-		st.Device = sel.slot
-	} else {
-		st.Device = ""
-	}
+
+	st.Device = sel.id
 	if st.Mode == "detail" && st.TaskID != "" {
 		return a.taskDetailView(ctx, r, st, snap, sel, t)
 	}
 	return a.overviewView(ctx, r, st, snap, sel, t)
+}
+
+func (a *app) addDeviceView(r *ext.UIRequest, snap appState, t *texts) *wire.View {
+	st := pageState{Mode: "add_device"}
+	defaultVal := "false"
+	if len(snap.devices) == 0 {
+		defaultVal = "true"
+	}
+	v6 := r.UIVersion == 0 || r.UIVersion >= 6
+	urlField := wire.Component{
+		Type:        wire.ComponentField,
+		Key:         "field-url",
+		Name:        "url",
+		Label:       t.fieldURLLabel,
+		Kind:        wire.FieldKindText,
+		Placeholder: t.fieldURLPlaceholder,
+	}
+	if v6 {
+		urlField.Detail = t.fieldURLDetail
+	}
+	actions := []wire.Component{{
+		Type:   wire.ComponentButton,
+		Key:    "btn-save-add",
+		Title:  t.saveAddBtn,
+		Action: &wire.Action{ID: "save_add", Submit: true},
+	}}
+	if r.UIVersion > 0 && r.UIVersion < 3 {
+		actions = append(actions, wire.Component{
+			Type:   wire.ComponentButton,
+			Key:    "btn-add-back",
+			Title:  t.back,
+			Action: &wire.Action{ID: "back"},
+		})
+	}
+	return &wire.View{
+		Title: t.addDeviceTitle,
+		State: ext.EncodeState(st),
+		Sections: []wire.Section{
+			{
+				Title:  t.addDeviceTitle,
+				Footer: t.formSecurityFooter,
+				Items: []wire.Component{
+					{
+						Type:        wire.ComponentField,
+						Key:         "field-name",
+						Name:        "name",
+						Label:       t.fieldNameLabel,
+						Kind:        wire.FieldKindText,
+						Placeholder: t.fieldNamePlaceholder,
+					},
+					urlField,
+					{
+						Type:        wire.ComponentField,
+						Key:         "field-token",
+						Name:        "token",
+						Label:       t.fieldTokenLabel,
+						Kind:        wire.FieldKindSecret,
+						Placeholder: t.fieldTokenAddPlaceholder,
+					},
+					{
+						Type:  wire.ComponentField,
+						Key:   "field-default",
+						Name:  "default",
+						Label: t.fieldDefaultLabel,
+						Kind:  wire.FieldKindToggle,
+						Value: defaultVal,
+					},
+				},
+			},
+			{Items: actions},
+		},
+	}
+}
+
+func (a *app) editDeviceView(r *ext.UIRequest, st pageState, snap appState, t *texts) *wire.View {
+	dev, ok := snap.deviceByID(st.Device)
+	if !ok {
+		return &wire.View{
+			Title: t.editDeviceTitle,
+			State: ext.EncodeState(pageState{Mode: "overview"}),
+			Sections: []wire.Section{{
+				Items: []wire.Component{
+					{
+						Type:  wire.ComponentEmpty,
+						Key:   "edit-missing",
+						Title: t.deviceNotFound,
+					},
+					{
+						Type:   wire.ComponentButton,
+						Key:    "btn-edit-missing-back",
+						Title:  t.back,
+						Action: &wire.Action{ID: "back"},
+					},
+				},
+			}},
+		}
+	}
+
+	st = pageState{Mode: "device_edit", Device: dev.id}
+	viewTitle := clipText(fmt.Sprintf("%s · %s", t.editDeviceTitle, dev.name), 200)
+	v6 := r.UIVersion == 0 || r.UIVersion >= 6
+	urlField := wire.Component{
+		Type:        wire.ComponentField,
+		Key:         "field-url",
+		Name:        "url",
+		Label:       t.fieldURLLabel,
+		Kind:        wire.FieldKindText,
+		Value:       displayEditableURL(dev.rawURL),
+		Placeholder: t.fieldURLPlaceholder,
+	}
+	tokenField := wire.Component{
+		Type:        wire.ComponentField,
+		Key:         "field-token",
+		Name:        "token",
+		Label:       t.fieldTokenLabel,
+		Kind:        wire.FieldKindSecret,
+		Placeholder: t.fieldTokenEditPlaceholder,
+	}
+	if v6 {
+		urlField.Detail = t.fieldURLDetail
+		tokenField.Detail = t.fieldTokenEditDetail
+	}
+	actions := []wire.Component{
+		{
+			Type:   wire.ComponentButton,
+			Key:    "btn-save-edit",
+			Title:  t.saveEditBtn,
+			Action: &wire.Action{ID: "save_edit:" + dev.id, Submit: true},
+		},
+		{
+			Type:   wire.ComponentButton,
+			Key:    "btn-edit-test",
+			Title:  t.testConnBtn,
+			Action: &wire.Action{ID: "test:" + dev.id},
+		},
+		{
+			Type:  wire.ComponentButton,
+			Key:   "btn-edit-delete",
+			Title: t.deleteDeviceBtn,
+			Role:  wire.ButtonRoleDestructive,
+			Action: &wire.Action{
+				ID:      "delete:" + dev.id,
+				Confirm: fmt.Sprintf(t.deleteConfirmFmt, dev.name),
+			},
+		},
+	}
+	if r.UIVersion > 0 && r.UIVersion < 3 {
+		actions = append(actions, wire.Component{
+			Type:   wire.ComponentButton,
+			Key:    "btn-edit-back",
+			Title:  t.back,
+			Action: &wire.Action{ID: "back"},
+		})
+	}
+
+	return &wire.View{
+		Title: viewTitle,
+		State: ext.EncodeState(st),
+		Sections: []wire.Section{
+			{
+				Title:  t.editDeviceTitle,
+				Footer: t.editTokenFooter,
+				Items: []wire.Component{
+					{
+						Type:        wire.ComponentField,
+						Key:         "field-name",
+						Name:        "name",
+						Label:       t.fieldNameLabel,
+						Kind:        wire.FieldKindText,
+						Value:       dev.name,
+						Placeholder: t.fieldNamePlaceholder,
+					},
+					urlField,
+					tokenField,
+					{
+						Type:  wire.ComponentField,
+						Key:   "field-default",
+						Name:  "default",
+						Label: t.fieldDefaultLabel,
+						Kind:  wire.FieldKindToggle,
+						Value: strconv.FormatBool(dev.defaultDev),
+					},
+				},
+			},
+			{Items: actions},
+		},
+	}
 }
 
 type uiDeviceProbe struct {
@@ -188,8 +590,9 @@ type uiDeviceProbe struct {
 	err   error
 }
 
-func (a *app) probeOverviewDevices(ctx context.Context, snap appState, selectedSlot string) map[string]uiDeviceProbe {
+func (a *app) probeOverviewDevices(ctx context.Context, snap appState, selectedID string) map[string]uiDeviceProbe {
 	results := make([]uiDeviceProbe, len(snap.devices))
+	sem := make(chan struct{}, maxProbeConcurrency)
 	var wg sync.WaitGroup
 	for i, d := range snap.devices {
 		if !d.ready() {
@@ -199,21 +602,23 @@ func (a *app) probeOverviewDevices(ctx context.Context, snap appState, selectedS
 		wg.Add(1)
 		go func(idx int, entry deviceEntry) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			probeCtx := ctx
 			var cancel context.CancelFunc
-			if entry.slot != selectedSlot {
+			if entry.id != selectedID {
 				probeCtx, cancel = context.WithTimeout(ctx, peerProbeTimeout)
 				defer cancel()
 			}
 			info, err := entry.client.discover(probeCtx)
-			a.recordDevice(entry.slot, err)
+			a.recordDevice(entry.id, err)
 			results[idx] = uiDeviceProbe{entry: entry, info: info, err: err}
 		}(i, d)
 	}
 	wg.Wait()
 	out := make(map[string]uiDeviceProbe, len(results))
 	for _, r := range results {
-		out[r.entry.slot] = r
+		out[r.entry.id] = r
 	}
 	return out
 }
@@ -242,6 +647,84 @@ func formatVersionLabel(info discoveryInfo) string {
 	return fmt.Sprintf("%s (API v%d)", versionLabel, info.APIVersion)
 }
 
+func deviceRowActions(d deviceEntry, t *texts) []wire.RowAction {
+	editTitle := clipText(fmt.Sprintf("%s · %s", t.editDeviceTitle, d.name), 200)
+	acts := []wire.RowAction{
+		{
+			Title:  t.rowTest,
+			Icon:   wire.NavIconRefresh,
+			Action: wire.Action{ID: "test:" + d.id},
+		},
+		{
+			Title:  t.rowEdit,
+			Icon:   wire.NavIconEdit,
+			Action: *ext.Open("edit:"+d.id, "", pageState{Mode: "device_edit", Device: d.id}, editTitle),
+		},
+	}
+	if !d.defaultDev {
+		acts = append(acts, wire.RowAction{
+			Title:  t.rowSetDefault,
+			Icon:   wire.NavIconStar,
+			Action: wire.Action{ID: "set_default:" + d.id},
+		})
+	}
+	acts = append(acts, wire.RowAction{
+		Title: t.rowDelete,
+		Icon:  wire.NavIconTrash,
+		Role:  wire.ButtonRoleDestructive,
+		Action: wire.Action{
+			ID:      "delete:" + d.id,
+			Confirm: fmt.Sprintf(t.deleteConfirmFmt, d.name),
+		},
+	})
+	return acts
+}
+
+func selectedDeviceActionButtons(sel deviceEntry, t *texts) []wire.Component {
+	editTitle := clipText(fmt.Sprintf("%s · %s", t.editDeviceTitle, sel.name), 200)
+	btns := []wire.Component{
+		{
+			Type:   wire.ComponentButton,
+			Key:    "btn-test",
+			Title:  t.testConnBtn,
+			Action: &wire.Action{ID: "test:" + sel.id},
+		},
+		{
+			Type:   wire.ComponentButton,
+			Key:    "btn-edit",
+			Title:  t.editDeviceBtn,
+			Action: ext.Open("edit:"+sel.id, "", pageState{Mode: "device_edit", Device: sel.id}, editTitle),
+		},
+	}
+	if !sel.defaultDev {
+		btns = append(btns, wire.Component{
+			Type:   wire.ComponentButton,
+			Key:    "btn-set-default",
+			Title:  t.setDefaultBtn,
+			Action: &wire.Action{ID: "set_default:" + sel.id},
+		})
+	}
+	btns = append(btns,
+		wire.Component{
+			Type:  wire.ComponentButton,
+			Key:   "btn-delete",
+			Title: t.deleteDeviceBtn,
+			Role:  wire.ButtonRoleDestructive,
+			Action: &wire.Action{
+				ID:      "delete:" + sel.id,
+				Confirm: fmt.Sprintf(t.deleteConfirmFmt, sel.name),
+			},
+		},
+		wire.Component{
+			Type:   wire.ComponentButton,
+			Key:    "btn-refresh",
+			Title:  t.refresh,
+			Action: &wire.Action{ID: "refresh"},
+		},
+	)
+	return btns
+}
+
 func (a *app) overviewView(ctx context.Context, r *ext.UIRequest, st pageState, snap appState, sel deviceEntry, t *texts) (*wire.View, error) {
 	if st.Pages < 1 {
 		st.Pages = 1
@@ -249,109 +732,106 @@ func (a *app) overviewView(ctx context.Context, r *ext.UIRequest, st pageState, 
 	st.Mode = "overview"
 	st.TaskID = ""
 
-	probes := a.probeOverviewDevices(ctx, snap, sel.slot)
-	selProbe := probes[sel.slot]
+	probes := a.probeOverviewDevices(ctx, snap, sel.id)
+	selProbe := probes[sel.id]
 
 	var sections []wire.Section
 	multi := snap.isMultiDevice()
+	v6 := r.UIVersion == 0 || r.UIVersion >= 6
 
-	if multi {
-		if r.UIVersion >= 2 {
-			choices := make([]wire.Choice, 0, len(snap.devices))
-			for _, d := range snap.devices {
-				choices = append(choices, wire.Choice{
-					Value: d.slot,
-					Title: segmentedChoiceTitle(d, snap),
-				})
-			}
-			sections = append(sections, wire.Section{
-				Items: []wire.Component{{
-					Type:    wire.ComponentSegmented,
-					Key:     "device-picker",
-					Name:    "device",
-					Value:   sel.slot,
-					Choices: choices,
-					Action:  &wire.Action{ID: "device"},
-				}},
+	if len(snap.devices) >= 2 && len(snap.devices) <= maxSegmentedDevices && r.UIVersion >= 2 {
+		choices := make([]wire.Choice, 0, len(snap.devices))
+		for _, d := range snap.devices {
+			choices = append(choices, wire.Choice{
+				Value: d.id,
+				Title: segmentedChoiceTitle(d, snap),
 			})
 		}
+		sections = append(sections, wire.Section{
+			Items: []wire.Component{{
+				Type:    wire.ComponentSegmented,
+				Key:     "device-picker",
+				Name:    "device",
+				Value:   sel.id,
+				Choices: choices,
+				Action:  &wire.Action{ID: "device"},
+			}},
+		})
+	}
 
-		devRows := make([]wire.Component, 0, len(snap.devices))
-		for _, d := range snap.devices {
-			p := probes[d.slot]
-			rowTitle := d.name
-			if d.isPrimary() {
-				rowTitle = fmt.Sprintf("%s · %s", d.name, t.primaryTag)
-			}
-			row := wire.Component{
-				Type:   wire.ComponentRow,
-				Key:    "dev-" + d.slot,
-				Title:  clipText(rowTitle, 1800),
-				Action: &wire.Action{ID: "device:" + d.slot, Values: map[string]string{"device": d.slot}},
-			}
-			switch {
-			case !d.ready():
-				row.Badge = &wire.Badge{Text: t.configError, Tone: wire.ToneCaution}
-				sub := d.maskedURL
-				if d.configErr != "" {
-					sub += " · " + snap.scrub(d.configErr)
-				}
-				row.Subtitle = clipText(sub, 1800)
-			case p.err != nil:
-				row.Badge = &wire.Badge{Text: t.offline, Tone: wire.ToneDanger}
-				row.Subtitle = clipText(d.maskedURL+" · "+snap.scrub(p.err.Error()), 1800)
-			default:
-				row.Badge = &wire.Badge{Text: t.online, Tone: wire.TonePositive}
-				row.Subtitle = clipText(d.maskedURL, 1800)
-				row.Value = clipText(formatVersionLabel(p.info), 200)
-			}
-			if d.slot == sel.slot {
-				row.Value = t.viewing
-			}
-			devRows = append(devRows, row)
+	devItems := make([]wire.Component, 0, len(snap.devices)+1)
+	for _, d := range snap.devices {
+		p := probes[d.id]
+		rowTitle := d.name
+		if d.defaultDev {
+			rowTitle = fmt.Sprintf("%s · %s", d.name, t.defaultTag)
 		}
-		sections = append(sections, wire.Section{Title: t.devices, Items: devRows})
+		row := wire.Component{
+			Type:   wire.ComponentRow,
+			Key:    "dev-" + d.id,
+			Title:  clipText(rowTitle, 1800),
+			Action: &wire.Action{ID: "device:" + d.id, Values: map[string]string{"device": d.id}},
+		}
+		if v6 {
+			row.Actions = deviceRowActions(d, t)
+		}
+		switch {
+		case !d.ready():
+			row.Badge = &wire.Badge{Text: t.configError, Tone: wire.ToneCaution}
+			sub := d.maskedURL
+			if d.configErr != "" {
+				sub += " · " + snap.scrub(d.configErr)
+			}
+			row.Subtitle = clipText(sub, 1800)
+		case p.err != nil:
+			row.Badge = &wire.Badge{Text: t.offline, Tone: wire.ToneDanger}
+			row.Subtitle = clipText(d.maskedURL+" · "+snap.scrub(p.err.Error()), 1800)
+		default:
+			row.Badge = &wire.Badge{Text: t.online, Tone: wire.TonePositive}
+			row.Subtitle = clipText(d.maskedURL, 1800)
+			row.Value = clipText(formatVersionLabel(p.info), 200)
+		}
+		if d.id == sel.id {
+			row.Value = t.viewing
+		}
+		devItems = append(devItems, row)
+	}
+	devItems = append(devItems, wire.Component{
+		Type:   wire.ComponentButton,
+		Key:    "btn-add-device",
+		Title:  t.addDeviceBtn,
+		Action: ext.Open("add_device", "", pageState{Mode: "add_device"}, t.addDeviceTitle),
+	})
+	sections = append(sections, wire.Section{Title: t.devices, Items: devItems})
+
+	connTitle := fmt.Sprintf("%s · %s", t.connection, sel.name)
+	serverRowTitle := fmt.Sprintf("%s · %s", t.serverRow, sel.name)
+	if sel.defaultDev {
+		serverRowTitle = fmt.Sprintf("%s (%s)", sel.name, t.defaultTag)
 	}
 
-	connTitle := t.connection
-	serverRowTitle := t.serverRow
-	if multi {
-		connTitle = fmt.Sprintf("%s · %s", t.connection, sel.name)
-		serverRowTitle = fmt.Sprintf("%s (%s)", sel.name, sel.slot)
-	} else if !strings.EqualFold(sel.name, "default") {
-		serverRowTitle = fmt.Sprintf("%s · %s", t.serverRow, sel.name)
-	}
-
-	// Selected device has a configuration error (missing token/URL or invalid URL).
 	if !sel.ready() {
 		errText := snap.scrub(sel.configErr)
 		if errText == "" {
 			errText = t.notConfigured
 		}
-		sections = append(sections, wire.Section{
-			Title: connTitle,
-			Items: []wire.Component{
-				{
-					Type:     wire.ComponentRow,
-					Key:      "conn-status",
-					Title:    clipText(serverRowTitle, 1800),
-					Subtitle: clipText(sel.maskedURL, 1800),
-					Badge:    &wire.Badge{Text: t.configError, Tone: wire.ToneCaution},
-				},
-				{
-					Type:  wire.ComponentText,
-					Key:   "conn-error",
-					Text:  clipText(errText, 1800),
-					Style: wire.TextStyleSecondary,
-				},
-				{
-					Type:   wire.ComponentButton,
-					Key:    "btn-refresh",
-					Title:  t.refresh,
-					Action: &wire.Action{ID: "refresh"},
-				},
+		connItems := []wire.Component{
+			{
+				Type:     wire.ComponentRow,
+				Key:      "conn-status",
+				Title:    clipText(serverRowTitle, 1800),
+				Subtitle: clipText(sel.maskedURL, 1800),
+				Badge:    &wire.Badge{Text: t.configError, Tone: wire.ToneCaution},
 			},
-		})
+			{
+				Type:  wire.ComponentText,
+				Key:   "conn-error",
+				Text:  clipText(errText, 1800),
+				Style: wire.TextStyleSecondary,
+			},
+		}
+		connItems = append(connItems, selectedDeviceActionButtons(sel, t)...)
+		sections = append(sections, wire.Section{Title: connTitle, Items: connItems})
 		return &wire.View{
 			Title:        t.title,
 			State:        ext.EncodeState(st),
@@ -360,32 +840,24 @@ func (a *app) overviewView(ctx context.Context, r *ext.UIRequest, st pageState, 
 		}, nil
 	}
 
-	// Selected device is configured but unreachable/errored.
 	if selProbe.err != nil {
-		sections = append(sections, wire.Section{
-			Title: connTitle,
-			Items: []wire.Component{
-				{
-					Type:     wire.ComponentRow,
-					Key:      "conn-status",
-					Title:    clipText(serverRowTitle, 1800),
-					Subtitle: clipText(sel.maskedURL, 1800),
-					Badge:    &wire.Badge{Text: t.offline, Tone: wire.ToneDanger},
-				},
-				{
-					Type:  wire.ComponentText,
-					Key:   "conn-error",
-					Text:  clipText(snap.scrub(selProbe.err.Error()), 1800),
-					Style: wire.TextStyleSecondary,
-				},
-				{
-					Type:   wire.ComponentButton,
-					Key:    "btn-refresh",
-					Title:  t.refresh,
-					Action: &wire.Action{ID: "refresh"},
-				},
+		connItems := []wire.Component{
+			{
+				Type:     wire.ComponentRow,
+				Key:      "conn-status",
+				Title:    clipText(serverRowTitle, 1800),
+				Subtitle: clipText(sel.maskedURL, 1800),
+				Badge:    &wire.Badge{Text: t.offline, Tone: wire.ToneDanger},
 			},
-		})
+			{
+				Type:  wire.ComponentText,
+				Key:   "conn-error",
+				Text:  clipText(snap.scrub(selProbe.err.Error()), 1800),
+				Style: wire.TextStyleSecondary,
+			},
+		}
+		connItems = append(connItems, selectedDeviceActionButtons(sel, t)...)
+		sections = append(sections, wire.Section{Title: connTitle, Items: connItems})
 		return &wire.View{
 			Title:        t.title,
 			State:        ext.EncodeState(st),
@@ -426,19 +898,15 @@ func (a *app) overviewView(ctx context.Context, r *ext.UIRequest, st pageState, 
 			Style: wire.TextStyleSecondary,
 		})
 	}
-	connItems = append(connItems, wire.Component{
-		Type:   wire.ComponentButton,
-		Key:    "btn-refresh",
-		Title:  t.refresh,
-		Action: &wire.Action{ID: "refresh"},
-	})
+	connItems = append(connItems, selectedDeviceActionButtons(sel, t)...)
 	sections = append(sections, wire.Section{Title: connTitle, Items: connItems})
 
 	tasksTitle := t.recentTasks
-	if multi {
+	if multi || !strings.EqualFold(sel.name, "default") {
 		tasksTitle = fmt.Sprintf("%s · %s", t.recentTasks, sel.name)
 	}
-	tasks, hasMore, listErr := collectTasks(ctx, sel.client, st.Pages)
+	taskBudget := max(20, min(maxViewTasks, maxOverviewTaskItems-len(snap.devices)))
+	tasks, hasMore, listErr := collectTasks(ctx, sel.client, st.Pages, taskBudget)
 	taskSection := wire.Section{Title: tasksTitle}
 	if listErr != nil {
 		taskSection.Items = []wire.Component{{
@@ -467,14 +935,8 @@ func (a *app) overviewView(ctx context.Context, r *ext.UIRequest, st pageState, 
 			}
 			sub := formatTaskSubtitle(item, loc)
 			badge := statusBadge(item.Status, t)
-			vals := map[string]string{"task_id": item.TaskID}
-			if multi {
-				vals["device"] = sel.slot
-			}
-			detailActionID := "detail:" + item.TaskID
-			if multi {
-				detailActionID = "detail:" + sel.slot + ":" + item.TaskID
-			}
+			vals := map[string]string{"task_id": item.TaskID, "device": sel.id}
+			detailActionID := "detail:" + sel.id + ":" + item.TaskID
 			taskSection.Items = append(taskSection.Items, wire.Component{
 				Type:     wire.ComponentRow,
 				Key:      "task-" + item.TaskID,
@@ -530,7 +992,7 @@ func (a *app) taskDetailView(ctx context.Context, r *ext.UIRequest, st pageState
 	}
 
 	task, err := sel.client.taskStatus(ctx, st.TaskID)
-	a.recordDevice(sel.slot, err)
+	a.recordDevice(sel.id, err)
 	if err != nil {
 		return &wire.View{
 			Title: clipText(viewTitle, 200),
@@ -553,7 +1015,7 @@ func (a *app) taskDetailView(ctx context.Context, r *ext.UIRequest, st pageState
 		headItems = append(headItems, wire.Component{
 			Type:  wire.ComponentText,
 			Key:   "detail-device",
-			Text:  clipText(fmt.Sprintf("%s%s (%s) · %s", t.devicePrefix, sel.name, sel.slot, sel.maskedURL), 1800),
+			Text:  clipText(fmt.Sprintf("%s%s · %s", t.devicePrefix, sel.label(), sel.maskedURL), 1800),
 			Style: wire.TextStyleSecondary,
 		})
 	}
@@ -658,11 +1120,14 @@ func (a *app) taskDetailView(ctx context.Context, r *ext.UIRequest, st pageState
 	}, nil
 }
 
-func collectTasks(ctx context.Context, c *client, pages int) ([]remoteTask, bool, error) {
+func collectTasks(ctx context.Context, c *client, pages, maxItems int) ([]remoteTask, bool, error) {
+	if maxItems <= 0 {
+		maxItems = maxViewTasks
+	}
 	var out []remoteTask
 	before := ""
 	hasMore := false
-	for p := 0; p < pages && len(out) < maxViewTasks; p++ {
+	for p := 0; p < pages && len(out) < maxItems; p++ {
 		res, err := c.listTasks(ctx, pageBatchSize, before)
 		if err != nil {
 			return nil, false, err
@@ -675,10 +1140,10 @@ func collectTasks(ctx context.Context, c *client, pages int) ([]remoteTask, bool
 		before = res.NextBefore
 		hasMore = true
 	}
-	if len(out) > maxViewTasks {
-		out = out[:maxViewTasks]
+	if len(out) > maxItems {
+		out = out[:maxItems]
 	}
-	return out, hasMore && len(out) < maxViewTasks && pages < maxOverviewPages, nil
+	return out, hasMore && len(out) < maxItems && pages < maxOverviewPages, nil
 }
 
 func deviceSummaryRow(dev deviceResponse, t *texts) wire.Component {

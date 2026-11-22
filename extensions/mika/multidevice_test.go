@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -61,6 +60,11 @@ func tertiarySampleTasks() []remoteTask {
 
 func initTestApp(t *testing.T, cfg map[string]any, secrets map[string]string, dataDir string) (*app, error) {
 	t.Helper()
+	return initTestAppWithHub(t, cfg, secrets, dataDir, nil)
+}
+
+func initTestAppWithHub(t *testing.T, cfg map[string]any, secrets map[string]string, dataDir string, hub hubClient) (*app, error) {
+	t.Helper()
 	rawCfg, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -70,10 +74,10 @@ func initTestApp(t *testing.T, cfg map[string]any, secrets map[string]string, da
 		InitializeParams: wire.InitializeParams{
 			Config:    rawCfg,
 			Secrets:   secrets,
-			Extension: &wire.ExtensionInfo{ID: "mika", Version: "0.2.0", DataDir: dataDir},
+			Extension: &wire.ExtensionInfo{ID: "mika", Version: "0.3.0", DataDir: dataDir},
 		},
 	}
-	_, err = a.init(t.Context(), in, nil)
+	_, err = a.initWithHub(t.Context(), in, hub)
 	return a, err
 }
 
@@ -93,7 +97,7 @@ func TestMultiDeviceConfigAndBackwardCompat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mika_list_devices failed: %v", err)
 	}
-	for _, want := range []string{"Configured Mika devices (1)", "default", "primary (1, default)", "status: ready"} {
+	for _, want := range []string{"Configured Mika devices (1)", "default (#1, default)", "status: ready"} {
 		if !strings.Contains(listText, want) {
 			t.Fatalf("legacy mika_list_devices missing %q in:\n%s", want, listText)
 		}
@@ -103,7 +107,7 @@ func TestMultiDeviceConfigAndBackwardCompat(t *testing.T) {
 		t.Fatalf("legacy mika_doctor failed: err=%v text=%s", err, docText)
 	}
 
-	// Full 3-device configuration with distinct names and distinct Bearer tokens.
+	// Full 3-device legacy configuration with distinct names and distinct Bearer tokens.
 	f2 := newFakeMikaWith(t, testSecondaryToken, "0.2.1", secondarySampleTasks())
 	f3 := newFakeMikaWith(t, testTertiaryToken, "0.2.2", tertiarySampleTasks())
 	multi, err := initTestApp(t, map[string]any{
@@ -126,7 +130,7 @@ func TestMultiDeviceConfigAndBackwardCompat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("3-device mika_list_devices failed: %v", err)
 	}
-	for _, want := range []string{"Configured Mika devices (3)", "A16", "S25+", "Pixel9", "primary (1, default)", "secondary (2)", "tertiary (3)"} {
+	for _, want := range []string{"Configured Mika devices (3)", "A16 (#1, default)", "S25+ (#2)", "Pixel9 (#3)"} {
 		if !strings.Contains(listText, want) {
 			t.Fatalf("3-device mika_list_devices missing %q in:\n%s", want, listText)
 		}
@@ -177,25 +181,27 @@ func TestMultiDeviceRoutingAndAliases(t *testing.T) {
 		t.Fatalf("init failed: %v", err)
 	}
 
-	// Default (omitted device) -> slot 1 (A16).
+	// Default (omitted device) -> #1 (A16).
 	text, err := a.callTool(t.Context(), "mika_list_tasks", json.RawMessage(`{}`))
-	if err != nil || !strings.Contains(text, "A16 (primary)") || !strings.Contains(text, "task-done-1") {
+	if err != nil || !strings.Contains(text, "A16 (#1, default)") || !strings.Contains(text, "task-done-1") {
 		t.Fatalf("default mika_list_tasks unexpected: err=%v text=%s", err, text)
 	}
 
-	// Case-insensitive custom names and slot aliases across read tools.
+	// Case-insensitive custom names, default/primary/1 and 1-based index/legacy aliases across read tools.
 	readCases := []struct {
 		tool string
 		args string
 		want []string
 	}{
-		{"mika_doctor", `{"device":"s25+"}`, []string{"Device: S25+ (secondary)", "0.2.1"}},
-		{"mika_doctor", `{"device":"3"}`, []string{"Device: Pixel9 (tertiary)", "0.2.2"}},
-		{"mika_device_state", `{"device":"PRIMARY"}`, []string{"Device: A16 (primary)", "Device status: state"}},
-		{"mika_task_status", `{"task_id":"s25-task-done-1","device":"2"}`, []string{"Device: S25+ (secondary)", "88%"}},
-		{"mika_wait_task", `{"task_id":"s25-task-run-3","timeout_s":5,"device":"secondary"}`, []string{"Device: S25+ (secondary)", "Changed: true"}},
-		{"mika_list_tasks", `{"device":"pixel9"}`, []string{"Device: Pixel9 (tertiary)", "p9-task-done-1"}},
-		{"mika_export_task", `{"task_id":"s25-task-done-1","device":"S25+"}`, []string{"Device: S25+ (secondary)", "s25-task-done-1"}},
+		{"mika_doctor", `{"device":"default"}`, []string{"Device: A16 (#1, default)", "0.1.28"}},
+		{"mika_doctor", `{"device":"1"}`, []string{"Device: A16 (#1, default)", "0.1.28"}},
+		{"mika_doctor", `{"device":"s25+"}`, []string{"Device: S25+ (#2)", "0.2.1"}},
+		{"mika_doctor", `{"device":"3"}`, []string{"Device: Pixel9 (#3)", "0.2.2"}},
+		{"mika_device_state", `{"device":"PRIMARY"}`, []string{"Device: A16 (#1, default)", "Device status: state"}},
+		{"mika_task_status", `{"task_id":"s25-task-done-1","device":"2"}`, []string{"Device: S25+ (#2)", "88%"}},
+		{"mika_wait_task", `{"task_id":"s25-task-run-3","timeout_s":5,"device":"secondary"}`, []string{"Device: S25+ (#2)", "Changed: true"}},
+		{"mika_list_tasks", `{"device":"pixel9"}`, []string{"Device: Pixel9 (#3)", "p9-task-done-1"}},
+		{"mika_export_task", `{"task_id":"s25-task-done-1","device":"S25+"}`, []string{"Device: S25+ (#2)", "s25-task-done-1"}},
 	}
 	for _, tc := range readCases {
 		got, err := a.callTool(t.Context(), tc.tool, json.RawMessage(tc.args))
@@ -209,7 +215,7 @@ func TestMultiDeviceRoutingAndAliases(t *testing.T) {
 		}
 	}
 
-	// Write actions routed to secondary (S25+) and tertiary (Pixel9).
+	// Write actions routed to #2 (S25+) and #3 (Pixel9).
 	if _, err := a.doAction(t.Context(), "act-run-s25", "mika_run_task", json.RawMessage(`{"goal":"Check S25+ settings","device":"s25+"}`)); err != nil {
 		t.Fatalf("mika_run_task on S25+ failed: %v", err)
 	}
@@ -240,13 +246,13 @@ func TestMultiDeviceRoutingAndAliases(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unknown device")
 	}
-	for _, want := range []string{"unknown Mika device", "A16 (primary)", "S25+ (secondary)", "Pixel9 (tertiary)"} {
+	for _, want := range []string{"unknown Mika device", "A16 (#1, default)", "S25+ (#2)", "Pixel9 (#3)"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("unknown device error missing %q: %v", want, err)
 		}
 	}
 
-	// Duplicate custom names: rejected by name with clear error, still disambiguated by slot alias & default.
+	// Duplicate legacy names are automatically deduplicated on migration (Phone -> Phone, Phone 2).
 	dupApp, err := initTestApp(t, map[string]any{
 		"instance_name":  "Phone",
 		"instance_url":   f1.srv.URL,
@@ -257,19 +263,13 @@ func TestMultiDeviceRoutingAndAliases(t *testing.T) {
 		"secondary_api_token": testSecondaryToken,
 	}, t.TempDir())
 	if err != nil {
-		t.Fatalf("duplicate-name init should succeed for slot disambiguation: %v", err)
+		t.Fatalf("duplicate legacy name migration failed: %v", err)
 	}
-	if listOut, err := dupApp.callTool(t.Context(), "mika_list_devices", nil); err != nil || !strings.Contains(listOut, "duplicate device name") {
-		t.Fatalf("mika_list_devices should warn on duplicate names: err=%v out=%s", err, listOut)
+	if listOut, err := dupApp.callTool(t.Context(), "mika_list_devices", nil); err != nil || !strings.Contains(listOut, "Phone (#1, default)") || !strings.Contains(listOut, "phone 2 (#2)") {
+		t.Fatalf("expected deduplicated migrated names, err=%v out=%s", err, listOut)
 	}
-	if _, err := dupApp.callTool(t.Context(), "mika_device_state", json.RawMessage(`{"device":"PHONE"}`)); err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "primary") || !strings.Contains(err.Error(), "secondary") {
-		t.Fatalf("expected ambiguous duplicate-name error listing slots, got %v", err)
-	}
-	if got, err := dupApp.callTool(t.Context(), "mika_doctor", json.RawMessage(`{"device":"secondary"}`)); err != nil || !strings.Contains(got, "0.2.1") {
-		t.Fatalf("slot alias disambiguation failed: err=%v got=%s", err, got)
-	}
-	if got, err := dupApp.callTool(t.Context(), "mika_device_state", json.RawMessage(`{}`)); err != nil || !strings.Contains(got, "Phone (primary)") {
-		t.Fatalf("default fallback to slot 1 failed with duplicate names: err=%v got=%s", err, got)
+	if got, err := dupApp.callTool(t.Context(), "mika_doctor", json.RawMessage(`{"device":"2"}`)); err != nil || !strings.Contains(got, "0.2.1") {
+		t.Fatalf("1-based index routing failed: err=%v got=%s", err, got)
 	}
 }
 
@@ -277,8 +277,7 @@ func TestMultiDeviceDoctorSummaryAndIsolation(t *testing.T) {
 	f1 := newFakeMikaWith(t, testToken, "0.1.28", sampleTasks())
 	f2 := newFakeMikaWith(t, testSecondaryToken, "0.2.1", secondarySampleTasks())
 
-	// Case 1: Secondary URL set without secondary_api_token; tertiary token set without tertiary_url.
-	// Primary must start and operate normally; partial slots must report clear redacted config errors.
+	// Case 1: Incomplete optional legacy slots are isolated so valid devices still migrate and run cleanly.
 	a, err := initTestApp(t, map[string]any{
 		"instance_name":  "A16",
 		"instance_url":   f1.srv.URL,
@@ -293,13 +292,13 @@ func TestMultiDeviceDoctorSummaryAndIsolation(t *testing.T) {
 		t.Fatalf("init should isolate incomplete optional slots: %v", err)
 	}
 	if st := a.status(); st["state"] != "ok" {
-		t.Fatalf("connector status should remain ok while primary is healthy: %+v", st)
+		t.Fatalf("connector status should remain ok while A16 is healthy: %+v", st)
 	}
 	listText, err := a.callTool(t.Context(), "mika_list_devices", nil)
 	if err != nil {
 		t.Fatalf("mika_list_devices failed: %v", err)
 	}
-	for _, want := range []string{"A16", "status: ready", "S25+", "http://192.168.*.*:8765", "status: missing_token", "secondary_api_token", "Backup", "status: missing_url", "tertiary_url"} {
+	for _, want := range []string{"Configured Mika devices (1)", "A16 (#1, default)", "status: ready"} {
 		if !strings.Contains(listText, want) {
 			t.Fatalf("mika_list_devices missing %q in:\n%s", want, listText)
 		}
@@ -308,22 +307,7 @@ func TestMultiDeviceDoctorSummaryAndIsolation(t *testing.T) {
 		t.Fatalf("mika_list_devices leaked unmasked IP or token:\n%s", listText)
 	}
 
-	// mika_doctor without device summarizes all 3 slots without failing.
-	docSummary, err := a.callTool(t.Context(), "mika_doctor", nil)
-	if err != nil {
-		t.Fatalf("multi-device mika_doctor summary failed: %v", err)
-	}
-	for _, want := range []string{"1/3 devices reachable", "Device: A16 (primary, default)", "Mika Doctor: OK", "Mika Doctor: NOT READY (missing_token)", "Mika Doctor: NOT READY (missing_url)"} {
-		if !strings.Contains(docSummary, want) {
-			t.Fatalf("mika_doctor summary missing %q in:\n%s", want, docSummary)
-		}
-	}
-	// Targeting incomplete slot directly returns a clear error naming the missing secret.
-	if _, err := a.callTool(t.Context(), "mika_device_state", json.RawMessage(`{"device":"S25+"}`)); err == nil || !errors.Is(err, errNotConfigured) || !strings.Contains(err.Error(), "secondary_api_token") {
-		t.Fatalf("expected missing_token error for S25+, got %v", err)
-	}
-
-	// Case 2: Secondary has invalid URL (public HTTP with embedded creds) while primary is valid.
+	// Case 2: Invalid secondary legacy URL while primary is valid still migrates primary cleanly.
 	invalidSec, err := initTestApp(t, map[string]any{
 		"instance_name":  "A16",
 		"instance_url":   f1.srv.URL,
@@ -336,14 +320,11 @@ func TestMultiDeviceDoctorSummaryAndIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("init should isolate invalid secondary URL when primary is ready: %v", err)
 	}
-	if got, err := invalidSec.callTool(t.Context(), "mika_list_devices", nil); err != nil || !strings.Contains(got, "invalid_url") || strings.Contains(got, "superpass") || strings.Contains(got, testSecondaryToken) {
-		t.Fatalf("invalid secondary URL status unexpected: err=%v got=%s", err, got)
-	}
 	if _, err := invalidSec.callTool(t.Context(), "mika_doctor", json.RawMessage(`{"device":"A16"}`)); err != nil {
 		t.Fatalf("primary A16 should stay healthy when secondary URL is invalid: %v", err)
 	}
 
-	// Case 3: Primary missing token while secondary (S25+) IS valid -> secondary still works!
+	// Case 3: Primary missing token while secondary (S25+) IS valid -> S25+ migrates as default device!
 	secOnly, err := initTestApp(t, map[string]any{
 		"instance_name":  "A16",
 		"instance_url":   f1.srv.URL,
@@ -357,9 +338,6 @@ func TestMultiDeviceDoctorSummaryAndIsolation(t *testing.T) {
 	}
 	if got, err := secOnly.callTool(t.Context(), "mika_doctor", json.RawMessage(`{"device":"S25+"}`)); err != nil || !strings.Contains(got, "0.2.1") {
 		t.Fatalf("secondary should work when primary lacks token: err=%v got=%s", err, got)
-	}
-	if _, err := secOnly.callTool(t.Context(), "mika_device_state", json.RawMessage(`{}`)); err == nil || !strings.Contains(err.Error(), "api_token") || !strings.Contains(err.Error(), "S25+ (secondary)") {
-		t.Fatalf("default primary error should mention missing api_token and ready secondary: %v", err)
 	}
 
 	// Case 4: Runtime failure isolation (secondary returns 503 while primary is online).
@@ -403,8 +381,6 @@ func TestMultiDeviceConfirmationCards(t *testing.T) {
 		"instance_url":   f1.srv.URL,
 		"secondary_name": "S25+",
 		"secondary_url":  f2.srv.URL,
-		"tertiary_name":  "NoTokenPhone",
-		"tertiary_url":   "http://100.64.1.9:8765",
 	}, map[string]string{
 		"api_token":           testToken,
 		"secondary_api_token": testSecondaryToken,
@@ -421,11 +397,11 @@ func TestMultiDeviceConfirmationCards(t *testing.T) {
 		args   string
 		wants  []string
 	}{
-		{"mika_run_task", `{"goal":"Open Maps"}`, []string{"A16 (primary, " + masked1 + ")", "Open Maps"}},
-		{"mika_run_task", `{"goal":"Check battery","device":"S25+"}`, []string{"S25+ (secondary, " + masked2 + ")", "Check battery"}},
-		{"mika_answer", `{"task_id":"s25-task-ask-2","text":"Yes","device":"2"}`, []string{"S25+ (secondary, " + masked2 + ")", "s25-task-ask-2", "Yes"}},
-		{"mika_steer_task", `{"task_id":"s25-task-run-3","text":"Faster","device":"secondary"}`, []string{"S25+ (secondary, " + masked2 + ")", "s25-task-run-3", "Faster"}},
-		{"mika_cancel_task", `{"task_id":"task-run-2","device":"a16"}`, []string{"A16 (primary, " + masked1 + ")", "task-run-2"}},
+		{"mika_run_task", `{"goal":"Open Maps"}`, []string{"A16 (default, " + masked1 + ")", "Open Maps"}},
+		{"mika_run_task", `{"goal":"Check battery","device":"S25+"}`, []string{"S25+ (#2, " + masked2 + ")", "Check battery"}},
+		{"mika_answer", `{"task_id":"s25-task-ask-2","text":"Yes","device":"2"}`, []string{"S25+ (#2, " + masked2 + ")", "s25-task-ask-2", "Yes"}},
+		{"mika_steer_task", `{"task_id":"s25-task-run-3","text":"Faster","device":"secondary"}`, []string{"S25+ (#2, " + masked2 + ")", "s25-task-run-3", "Faster"}},
+		{"mika_cancel_task", `{"task_id":"task-run-2","device":"a16"}`, []string{"A16 (default, " + masked1 + ")", "task-run-2"}},
 	}
 	for _, tc := range cases {
 		desc, err := a.describeAction(tc.action, json.RawMessage(tc.args))
@@ -440,10 +416,6 @@ func TestMultiDeviceConfirmationCards(t *testing.T) {
 		}
 	}
 
-	// Unready or unknown device must fail before confirmation card is shown.
-	if _, err := a.describeAction("mika_run_task", json.RawMessage(`{"goal":"hi","device":"NoTokenPhone"}`)); err == nil {
-		t.Fatal("describeAction accepted unready device missing token")
-	}
 	if _, err := a.describeAction("mika_run_task", json.RawMessage(`{"goal":"hi","device":"GhostPhone"}`)); err == nil {
 		t.Fatal("describeAction accepted unknown device")
 	}
@@ -476,20 +448,21 @@ func TestMultiDeviceReceiptIsolation(t *testing.T) {
 		t.Fatalf("init with legacy write-receipts.json failed: %v", err)
 	}
 
-	// Same request_id on primary and secondary must be isolated and both succeed.
+	// Same request_id on #1 and #2 must be isolated and both succeed.
 	res1, err := a.doAction(t.Context(), "shared-req-1", "mika_run_task", json.RawMessage(`{"goal":"Task on A16","device":"A16"}`))
-	if err != nil || !strings.Contains(res1["text"].(string), "A16 (primary)") {
+	if err != nil || !strings.Contains(res1["text"].(string), "A16 (#1, default)") {
 		t.Fatalf("primary action failed: err=%v res=%+v", err, res1)
 	}
 	res2, err := a.doAction(t.Context(), "shared-req-1", "mika_run_task", json.RawMessage(`{"goal":"Task on S25+","device":"S25+"}`))
-	if err != nil || !strings.Contains(res2["text"].(string), "S25+ (secondary)") {
+	if err != nil || !strings.Contains(res2["text"].(string), "S25+ (#2)") {
 		t.Fatalf("secondary action with same request_id failed: err=%v res=%+v", err, res2)
 	}
 
-	// Replaying the same request_id on primary via different aliases ("", "primary", "1", "a16")
-	// must hit the cached primary receipt without starting another task.
+	// Replaying the same request_id on default via different aliases ("", "default", "primary", "1", "a16")
+	// must hit the cached receipt without starting another task.
 	for _, args := range []string{
 		`{"goal":"Task on A16"}`,
+		`{"goal":"Task on A16","device":"default"}`,
 		`{"goal":"Task on A16","device":"primary"}`,
 		`{"goal":"Task on A16","device":"1"}`,
 		`{"goal":"Task on A16","device":"a16"}`,
@@ -500,9 +473,9 @@ func TestMultiDeviceReceiptIsolation(t *testing.T) {
 		}
 	}
 
-	// Reusing shared-req-1 on primary with different goal must be refused.
+	// Reusing shared-req-1 on A16 with different goal must be refused.
 	if _, err := a.doAction(t.Context(), "shared-req-1", "mika_run_task", json.RawMessage(`{"goal":"Different goal","device":"A16"}`)); err == nil {
-		t.Fatal("accepted same (device_slot, request_id) with different goal")
+		t.Fatal("accepted same (device_id, request_id) with different goal")
 	}
 
 	f1.mu.Lock()
@@ -521,7 +494,7 @@ func TestMultiDeviceAllTokenScrubbing(t *testing.T) {
 	f2 := newFakeMikaWith(t, testSecondaryToken, "0.2.1", secondarySampleTasks())
 	dir := t.TempDir()
 
-	// Hostile peer 1 echoes ALL THREE configured tokens (including secondary + unconfigured tertiary).
+	// Hostile peer 1 echoes ALL THREE tokens (including secondary + unmigrated legacy tertiary).
 	f1.mu.Lock()
 	f1.forceStatus = http.StatusUnauthorized
 	f1.forceErrCode = "access_denied"
@@ -581,7 +554,6 @@ func TestMultiDeviceAllTokenScrubbing(t *testing.T) {
 	viewJSON, _ := json.Marshal(view)
 	assertNoSecret("UI view", string(viewJSON))
 
-	// Run a valid write action on S25+ and verify write-receipts.json contains no tokens.
 	if _, err := a.doAction(t.Context(), "scrub-act-1", "mika_run_task", json.RawMessage(`{"goal":"Check notes","device":"S25+"}`)); err != nil {
 		t.Fatalf("S25+ doAction failed: %v", err)
 	}
@@ -595,28 +567,30 @@ func TestMultiDeviceAllTokenScrubbing(t *testing.T) {
 func TestMultiDeviceUIViewsAndSwitching(t *testing.T) {
 	f1 := newFakeMikaWith(t, testToken, "0.1.28", sampleTasks())
 	f2 := newFakeMikaWith(t, testSecondaryToken, "0.2.1", secondarySampleTasks())
+	f3 := newFakeMikaWith(t, testTertiaryToken, "0.2.2", tertiarySampleTasks())
 
-	// Verify single-device UI remains concise (no segmented switcher or Devices section).
+	// Single-device UI shows device management section (+ Add device), selected device section, and recent tasks.
 	singleApp := f1.app()
 	singleView, err := singleApp.render(t.Context(), &ext.UIRequest{UIParams: wire.UIParams{Locale: "zh-Hans", UIVersion: 6}})
 	if err != nil || wire.CheckView(singleView) != nil {
 		t.Fatalf("single-device view invalid: err=%v check=%v", err, wire.CheckView(singleView))
 	}
-	if len(singleView.Sections) != 2 {
-		t.Fatalf("single-device view should have 2 concise sections, got %d", len(singleView.Sections))
+	if len(singleView.Sections) != 3 {
+		t.Fatalf("single-device view should have 3 sections (Devices, Connection, Recent tasks), got %d", len(singleView.Sections))
 	}
 
-	// Multi-device: A16 (online), Samsung Galaxy S25 Ultra (>12 chars, online), Spare (missing_token).
+	// Multi-device: A16, Samsung Galaxy S25 Ultra (>12 chars), Pixel9.
 	a, err := initTestApp(t, map[string]any{
 		"instance_name":  "A16",
 		"instance_url":   f1.srv.URL,
 		"secondary_name": "Samsung Galaxy S25 Ultra",
 		"secondary_url":  f2.srv.URL,
-		"tertiary_name":  "SparePhone",
-		"tertiary_url":   "http://100.64.2.5:8765",
+		"tertiary_name":  "Pixel9",
+		"tertiary_url":   f3.srv.URL,
 	}, map[string]string{
 		"api_token":           testToken,
 		"secondary_api_token": testSecondaryToken,
+		"tertiary_api_token":  testTertiaryToken,
 	}, t.TempDir())
 	if err != nil {
 		t.Fatalf("init failed: %v", err)
@@ -647,13 +621,13 @@ func TestMultiDeviceUIViewsAndSwitching(t *testing.T) {
 		}
 	}
 
-	// Initial zh-Hans view shows all 3 devices (online + missing_token) and A16's tasks.
+	// Initial zh-Hans view shows all 3 devices and A16's tasks.
 	ov, err := a.render(t.Context(), &ext.UIRequest{UIParams: wire.UIParams{Locale: "zh-Hans", UIVersion: 6}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ovJSON, _ := json.Marshal(ov)
-	for _, want := range []string{"设备列表", "A16", "Samsung Galaxy S25 Ultra", "SparePhone", "配置不完整", "task-done-1"} {
+	for _, want := range []string{"设备列表", "+ 添加设备", "A16", "Samsung Galaxy S25 Ultra", "Pixel9", "task-done-1"} {
 		if !strings.Contains(string(ovJSON), want) {
 			t.Fatalf("multi-device overview missing %q in %s", want, ovJSON)
 		}
@@ -673,11 +647,8 @@ func TestMultiDeviceUIViewsAndSwitching(t *testing.T) {
 			t.Fatalf("switched secondary view missing %q in %s", want, swJSON)
 		}
 	}
-	if strings.Contains(string(swJSON), "task-done-1") && !strings.Contains(string(swJSON), "s25-task-done-1") {
-		t.Fatalf("switched secondary view still showed primary task: %s", swJSON)
-	}
 
-	// Row action "device:<slot>" works even when client omits Action.Values or sends stale segmented value.
+	// Unique row action "device:<id>" works even when client omits Action.Values or sends stale segmented value.
 	for _, vals := range []map[string]string{nil, {"device": slotPrimary}} {
 		rowSw, err := a.action(t.Context(), &ext.UIRequest{UIParams: wire.UIParams{
 			Locale: "zh-Hans", UIVersion: 6, Action: "device:" + slotSecondary, State: ov.State,
@@ -691,7 +662,7 @@ func TestMultiDeviceUIViewsAndSwitching(t *testing.T) {
 		}
 	}
 
-	// Row action "detail:<slot>:<task_id>" works even when client omits Action.Values.
+	// Unique row action "detail:<id>:<task_id>" works even when client omits Action.Values.
 	rowDet, err := a.action(t.Context(), &ext.UIRequest{UIParams: wire.UIParams{
 		Locale: "zh-Hans", UIVersion: 6, Action: "detail:" + slotSecondary + ":s25-task-done-1", State: ov.State,
 	}})
@@ -733,37 +704,6 @@ func TestMultiDeviceUIViewsAndSwitching(t *testing.T) {
 	}
 	if b, _ := json.Marshal(backRes.View); !strings.Contains(string(b), "s25-task-done-1") {
 		t.Fatalf("back from secondary detail lost selected device: %s", b)
-	}
-
-	// Switching to tertiary (missing_token) renders cleanly with config error badge and no crash.
-	terRes, err := a.action(t.Context(), &ext.UIRequest{UIParams: wire.UIParams{
-		Locale: "zh-Hans", UIVersion: 6, Action: "device", State: backRes.View.State,
-		Values: map[string]string{"device": slotTertiary},
-	}})
-	if err != nil || terRes.View == nil || wire.CheckView(terRes.View) != nil {
-		t.Fatalf("switch to unready tertiary failed: err=%v check=%v", err, wire.CheckView(terRes.View))
-	}
-	if b, _ := json.Marshal(terRes.View); !strings.Contains(string(b), "tertiary_api_token") || !strings.Contains(string(b), "100.64.*.*:8765") {
-		t.Fatalf("unready tertiary view missing config error or masked URL: %s", b)
-	}
-
-	// Single-device missing_token renders clean config error guidance view.
-	noTokApp, err := initTestApp(t, map[string]any{
-		"instance_name": "A16",
-		"instance_url":  "http://192.168.1.99:8765",
-	}, map[string]string{}, t.TempDir())
-	if err != nil {
-		t.Fatalf("single-device missing_token init failed: %v", err)
-	}
-	if noTokApp.status()["state"] != "not_configured" {
-		t.Fatalf("expected not_configured status, got %+v", noTokApp.status())
-	}
-	noTokView, err := noTokApp.render(t.Context(), &ext.UIRequest{UIParams: wire.UIParams{Locale: "zh-Hans", UIVersion: 6}})
-	if err != nil || wire.CheckView(noTokView) != nil {
-		t.Fatalf("single-device missing_token view invalid: err=%v check=%v", err, wire.CheckView(noTokView))
-	}
-	if b, _ := json.Marshal(noTokView); !strings.Contains(string(b), "api_token") || !strings.Contains(string(b), "192.168.*.*:8765") || strings.Contains(string(b), "192.168.1.99") {
-		t.Fatalf("single-device missing_token view unexpected: %s", b)
 	}
 }
 

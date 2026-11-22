@@ -28,13 +28,13 @@ var deviceSchema = map[string]any{
 	"type":        "string",
 	"minLength":   1,
 	"maxLength":   maxDeviceSel,
-	"description": "Optional target phone name (case-insensitive, e.g. A16, S25+) or slot alias (primary/secondary/tertiary or 1/2/3). Omit to use the primary device (slot 1).",
+	"description": "Optional target phone name (case-insensitive), default/primary/1 for the default device, or 1-based device index (1, 2, 3, ...). Omit to use the default device.",
 }
 
 var readTools = []tool{
 	{
 		Name:        "mika_list_devices",
-		Description: "List all configured Mika Android devices with their slot, custom name, masked URL, configuration status and last known health (read-only).",
+		Description: "List all configured Mika Android devices with their 1-based index, name, default flag, masked URL, configuration status and last known health (read-only).",
 		InputSchema: map[string]any{
 			"type":       "object",
 			"properties": map[string]any{},
@@ -74,7 +74,7 @@ var readTools = []tool{
 	},
 	{
 		Name:        "mika_wait_task",
-		Description: "Wait up to timeout_s (1-50s, default from extension settings) for a Mika task's status to change or finish. Returns current status and changed flag; timeout without change is not a failure.",
+		Description: "Wait up to timeout_s (1-50s, default from extension settings; timeout_s=25 recommended to stay below 30s hub timeouts) for a Mika task's status to change or finish. Returns current status and changed flag; timeout without change is not a failure.",
 		InputSchema: map[string]any{
 			"type":     "object",
 			"required": []string{"task_id"},
@@ -167,6 +167,36 @@ var actionTools = []tool{
 	},
 }
 
+var directWriteTools = []tool{
+	{
+		Name:        "mika_run_task",
+		Description: "Start a remote task on the target Android phone through Mika directly (Persona confirmation card disabled in settings). Payments, logins and takeover confirmations still stay enforced on the phone.",
+		InputSchema: actionTools[0].InputSchema,
+	},
+	{
+		Name:        "mika_answer",
+		Description: "Answer Mika's currently open question for a task in waiting_for_answer state directly (Persona confirmation card disabled in settings). Cannot approve payments or phone takeovers.",
+		InputSchema: actionTools[1].InputSchema,
+	},
+	{
+		Name:        "mika_steer_task",
+		Description: "Append follow-up instructions to a currently running Mika task directly (Persona confirmation card disabled in settings), keeping the same task_id and context.",
+		InputSchema: actionTools[2].InputSchema,
+	},
+	{
+		Name:        "mika_cancel_task",
+		Description: "Request cancellation of an active remote Mika task directly (Persona confirmation card disabled in settings). Confirm completion by polling mika_task_status until cancelled.",
+		InputSchema: actionTools[3].InputSchema,
+	},
+}
+
+func allDirectTools() []tool {
+	out := make([]tool, 0, len(readTools)+len(directWriteTools))
+	out = append(out, readTools...)
+	out = append(out, directWriteTools...)
+	return out
+}
+
 func decode(raw json.RawMessage, out any) error {
 	if len(raw) == 0 || string(raw) == "null" {
 		raw = json.RawMessage(`{}`)
@@ -196,7 +226,7 @@ func (a *app) probeDeviceDoctor(ctx context.Context, d deviceEntry) doctorProbeR
 		return res
 	}
 	info, err := d.client.discover(ctx)
-	a.recordDevice(d.slot, err)
+	a.recordDevice(d.id, err)
 	if err != nil {
 		res.err = err
 		return res
@@ -233,7 +263,7 @@ func (a *app) callTool(ctx context.Context, name string, raw json.RawMessage) (s
 		if err != nil {
 			return "", err
 		}
-		// When device is omitted and multiple devices are configured, summarize every configured slot.
+		// When device is omitted and multiple devices are configured, summarize every configured device.
 		if sel == "" && len(st.devices) > 1 {
 			results := make([]doctorProbeResult, len(st.devices))
 			var wg sync.WaitGroup
@@ -269,7 +299,7 @@ func (a *app) callTool(ctx context.Context, name string, raw json.RawMessage) (s
 			return "", err
 		}
 		resp, err := dev.client.deviceState(ctx)
-		a.recordDevice(dev.slot, err)
+		a.recordDevice(dev.id, err)
 		if err != nil {
 			return "", err
 		}
@@ -288,7 +318,7 @@ func (a *app) callTool(ctx context.Context, name string, raw json.RawMessage) (s
 			return "", err
 		}
 		task, err := dev.client.taskStatus(ctx, strings.TrimSpace(in.TaskID))
-		a.recordDevice(dev.slot, err)
+		a.recordDevice(dev.id, err)
 		if err != nil {
 			return "", err
 		}
@@ -312,7 +342,7 @@ func (a *app) callTool(ctx context.Context, name string, raw json.RawMessage) (s
 			waitS = *in.TimeoutS
 		}
 		task, err := dev.client.waitTask(ctx, strings.TrimSpace(in.TaskID), waitS)
-		a.recordDevice(dev.slot, err)
+		a.recordDevice(dev.id, err)
 		if err != nil {
 			return "", err
 		}
@@ -336,7 +366,7 @@ func (a *app) callTool(ctx context.Context, name string, raw json.RawMessage) (s
 			limit = *in.Limit
 		}
 		res, err := dev.client.listTasks(ctx, limit, strings.TrimSpace(in.Before))
-		a.recordDevice(dev.slot, err)
+		a.recordDevice(dev.id, err)
 		if err != nil {
 			return "", err
 		}
@@ -363,7 +393,7 @@ func (a *app) callTool(ctx context.Context, name string, raw json.RawMessage) (s
 			maxEvents = *in.MaxEvents
 		}
 		rec, err := dev.client.exportTask(ctx, strings.TrimSpace(in.TaskID))
-		a.recordDevice(dev.slot, err)
+		a.recordDevice(dev.id, err)
 		if err != nil {
 			return "", err
 		}
@@ -373,42 +403,35 @@ func (a *app) callTool(ctx context.Context, name string, raw json.RawMessage) (s
 }
 
 func formatDeviceHeader(d deviceEntry) string {
-	return fmt.Sprintf("Device: %s (%s) | Instance: %s\n", d.name, d.slot, d.maskedURL)
+	return fmt.Sprintf("Device: %s | Instance: %s\n", d.label(), d.maskedURL)
 }
 
 func formatDeviceList(st appState) string {
 	if len(st.devices) == 0 {
-		return "No Mika devices configured. Set instance_url and api_token in Settings › Extensions › Mika.\n"
+		return "No Mika devices configured. Open the Mika page to add an Android phone.\n"
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Configured Mika devices (%d):\n", len(st.devices))
-	var dupNames []string
 	for _, d := range st.devices {
-		slotTag := fmt.Sprintf("%s (%d)", d.slot, d.index)
-		if d.isPrimary() {
-			slotTag = fmt.Sprintf("%s (%d, default)", d.slot, d.index)
+		role := fmt.Sprintf("#%d", d.index)
+		if d.isDefault() {
+			role = fmt.Sprintf("#%d, default", d.index)
 		}
-		fmt.Fprintf(&b, "- %s | slot: %s | instance: %s | status: %s\n",
-			d.name, slotTag, d.maskedURL, d.configState)
+		fmt.Fprintf(&b, "- %s (%s) | instance: %s | status: %s\n",
+			d.name, role, d.maskedURL, d.configState)
 		if d.configErr != "" {
 			fmt.Fprintf(&b, "  Config issue: %s\n", clipText(st.scrub(d.configErr), 300))
 		}
-		if h, ok := st.health[d.slot]; ok {
+		if h, ok := st.health[d.id]; ok {
 			if h.lastErr != nil {
 				fmt.Fprintf(&b, "  Last error: %s\n", clipText(st.scrub(h.lastErr.Error()), 200))
 			} else if !h.lastOK.IsZero() {
 				fmt.Fprintf(&b, "  Last check: OK at %s\n", h.lastOK.UTC().Format(time.RFC3339))
 			}
 		}
-		if st.hasDuplicateName(d.name) && !slices.ContainsFunc(dupNames, func(s string) bool { return strings.EqualFold(s, d.name) }) {
-			dupNames = append(dupNames, d.name)
-		}
 	}
-	if len(dupNames) > 0 {
-		fmt.Fprintf(&b, "\nWarning: duplicate device name(s) detected (%s). Address devices by slot alias (primary/secondary/tertiary or 1/2/3) or assign unique names in Settings › Extensions.\n",
-			strings.Join(dupNames, ", "))
-	}
-	b.WriteString("\nPass optional device=\"<name>\" or slot alias (primary/secondary/tertiary, 1/2/3) to any mika_* tool; omit device to use slot 1 (primary).\n")
+	b.WriteString("\nPass optional device=\"<name>\", default/primary, or 1-based index (1..N) to any mika_* tool; omit device to use the default device (#1).\n")
+	b.WriteString("Manage devices (add, edit, set default, test or delete) on the Mika page.\n")
 	return b.String()
 }
 
@@ -421,22 +444,8 @@ func formatMultiDoctor(st appState, results []doctorProbeResult) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Mika Doctor Summary: %d/%d devices reachable\n", okCount, len(results))
-	var dupNames []string
-	for _, d := range st.devices {
-		if st.hasDuplicateName(d.name) && !slices.ContainsFunc(dupNames, func(s string) bool { return strings.EqualFold(s, d.name) }) {
-			dupNames = append(dupNames, d.name)
-		}
-	}
-	if len(dupNames) > 0 {
-		fmt.Fprintf(&b, "Warning: duplicate device name(s) (%s); use slot aliases (primary/secondary/tertiary or 1/2/3) or rename devices in Settings › Extensions.\n",
-			strings.Join(dupNames, ", "))
-	}
 	for _, r := range results {
-		slotTag := r.entry.slot
-		if r.entry.isPrimary() {
-			slotTag += ", default"
-		}
-		fmt.Fprintf(&b, "\n=== Device: %s (%s) ===\n", r.entry.name, slotTag)
+		fmt.Fprintf(&b, "\n=== Device: %s ===\n", r.entry.label())
 		switch {
 		case !r.entry.ready():
 			fmt.Fprintf(&b, "Mika Doctor: NOT READY (%s)\n", r.entry.configState)
@@ -458,7 +467,7 @@ func formatMultiDoctor(st appState, results []doctorProbeResult) string {
 func formatDoctor(d deviceEntry, info discoveryInfo, dev *deviceResponse, devErr error, allTokens []string) string {
 	var b strings.Builder
 	b.WriteString("Mika Doctor: OK\n")
-	fmt.Fprintf(&b, "Device: %s (%s)\n", d.name, d.slot)
+	fmt.Fprintf(&b, "Device: %s\n", d.label())
 	fmt.Fprintf(&b, "Instance: %s\n", d.maskedURL)
 	fmt.Fprintf(&b, "Server version: %s | API version: %d\n", info.ServerVersion, info.APIVersion)
 	if len(info.Capabilities) > 0 {
@@ -609,7 +618,7 @@ func taskNextStepHint(t remoteTask) string {
 	case "waiting_for_answer":
 		return "Mika is waiting for an answer. Relay the question to the user and reply with mika_answer."
 	case "waiting_on_phone":
-		return "User action is required directly on the Android phone (payment, login, confirmation or takeover). Inform the user, then wait with mika_wait_task or cancel with mika_cancel_task."
+		return "User action is required directly on the Android phone (payment, login, confirmation or takeover). Inform the user, then wait with mika_wait_task (timeout_s=25) or cancel with mika_cancel_task."
 	case "paused":
 		return "Task is paused (commonly because the phone screen is locked). Ask the user to unlock the phone, then continue waiting."
 	case "starting", "running", "queued":

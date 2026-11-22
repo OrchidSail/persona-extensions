@@ -413,19 +413,22 @@ func (f *fakeMika) app() *app {
 	if err != nil {
 		panic(err)
 	}
+	stored := []storedDevice{{
+		ID:      slotPrimary,
+		Name:    "default",
+		URL:     base,
+		Token:   f.expectedToken,
+		Default: true,
+	}}
+	allTokens := collectScrubTokens(f.expectedToken)
 	return &app{
-		devices: []deviceEntry{{
-			slot:        slotPrimary,
-			index:       1,
-			name:        "default",
-			maskedURL:   maskInstanceURL(base),
-			configState: deviceStateReady,
-			client:      newClient(base, f.expectedToken),
-		}},
-		allTokens:   collectScrubTokens(f.expectedToken),
-		defaultWait: 25,
-		receipts:    newWriteStore(""),
-		health:      map[string]deviceHealth{},
+		stored:         stored,
+		migratedLegacy: true,
+		devices:        buildDeviceEntries(stored, allTokens),
+		allTokens:      allTokens,
+		defaultWait:    25,
+		receipts:       newWriteStore(""),
+		health:         map[string]deviceHealth{},
 	}
 }
 
@@ -441,30 +444,35 @@ func TestManifest(t *testing.T) {
 	if err := json.Unmarshal(manifest, &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.ID != "mika" || m.Version != "0.2.1" {
+	if m.ID != "mika" || m.Version != "0.3.0" {
 		t.Fatalf("unexpected identity: %+v", m)
 	}
-	if len(m.Secrets) != 3 ||
-		m.Secrets[0].Name != "api_token" || !m.Secrets[0].Required ||
-		m.Secrets[1].Name != "secondary_api_token" || m.Secrets[1].Required ||
-		m.Secrets[2].Name != "tertiary_api_token" || m.Secrets[2].Required {
-		t.Fatalf("unexpected secrets: %+v", m.Secrets)
+	// v0.3.0 stores device tokens in the hub's encrypted connector secret store, not manifest.secrets.
+	if len(m.Secrets) != 0 {
+		t.Fatalf("expected no manifest.secrets in 0.3.0, got: %+v", m.Secrets)
 	}
-	// Configuration must keep only instance_url required and must never store plaintext tokens.
 	var rawManifest map[string]any
 	if err := json.Unmarshal(manifest, &rawManifest); err != nil {
 		t.Fatal(err)
 	}
 	cfg := rawManifest["configuration"].(map[string]any)
-	req := cfg["required"].([]any)
-	if len(req) != 1 || req[0] != "instance_url" {
-		t.Fatalf("unexpected required config fields: %v", req)
+	if req, ok := cfg["required"]; ok {
+		if reqList, _ := req.([]any); len(reqList) != 0 {
+			t.Fatalf("expected no required config fields in 0.3.0, got: %v", reqList)
+		}
 	}
 	props := cfg["properties"].(map[string]any)
-	for _, wantProp := range []string{"instance_name", "instance_url", "secondary_name", "secondary_url", "tertiary_name", "tertiary_url", "default_wait_seconds"} {
+	if len(props) != 2 {
+		t.Fatalf("0.3.0 configuration must be streamlined to exactly 2 global fields, got %d: %v", len(props), props)
+	}
+	for _, wantProp := range []string{"default_wait_seconds", "require_confirmation"} {
 		if _, ok := props[wantProp]; !ok {
 			t.Fatalf("missing configuration property %q", wantProp)
 		}
+	}
+	reqConf := props["require_confirmation"].(map[string]any)
+	if reqConf["type"] != "boolean" || reqConf["default"] != true {
+		t.Fatalf("require_confirmation must default to boolean true, got: %+v", reqConf)
 	}
 	for k := range props {
 		if strings.Contains(strings.ToLower(k), "token") || strings.Contains(strings.ToLower(k), "secret") {
@@ -493,15 +501,15 @@ func TestInitValidation(t *testing.T) {
 		InitializeParams: wire.InitializeParams{
 			Config:    json.RawMessage(`{"instance_url":"` + f.srv.URL + `","default_wait_seconds":42}`),
 			Secrets:   map[string]string{"api_token": testToken},
-			Extension: &wire.ExtensionInfo{ID: "mika", Version: "0.2.0", DataDir: t.TempDir()},
+			Extension: &wire.ExtensionInfo{ID: "mika", Version: "0.3.0", DataDir: t.TempDir()},
 		},
 	}
 	if _, err := a.init(t.Context(), in, nil); err != nil {
 		t.Fatalf("valid init failed: %v", err)
 	}
 	snap := a.snapshot()
-	if snap.defaultWait != 42 || len(snap.devices) != 1 || snap.devices[0].name != "default" || !strings.HasSuffix(snap.devices[0].client.base, "/api/v1") {
-		t.Fatalf("unexpected init state: wait=%d devices=%+v", snap.defaultWait, snap.devices)
+	if snap.defaultWait != 42 || snap.skipConfirmation || len(snap.devices) != 1 || snap.devices[0].name != "default" || !strings.HasSuffix(snap.devices[0].client.base, "/api/v1") {
+		t.Fatalf("unexpected init state: wait=%d skipConfirm=%v devices=%+v", snap.defaultWait, snap.skipConfirmation, snap.devices)
 	}
 
 	badWait := &ext.Init{
@@ -707,7 +715,7 @@ func TestWriteActions(t *testing.T) {
 	// mika_run_task describe + do (verifies conversation_id -> conversation wire mapping)
 	runArgs := json.RawMessage(`{"goal":"Open Notes and draft agenda","conversation_id":"` + conv + `","request_id":"` + reqUUID + `"}`)
 	desc, err := a.describeAction("mika_run_task", runArgs)
-	if err != nil || !strings.Contains(desc["summary"].(string), "Open Notes and draft agenda") || !strings.Contains(desc["summary"].(string), "default (primary, ") {
+	if err != nil || !strings.Contains(desc["summary"].(string), "Open Notes and draft agenda") || !strings.Contains(desc["summary"].(string), "default (default, ") {
 		t.Fatalf("describe mika_run_task: err=%v desc=%+v", err, desc)
 	}
 	res, err := a.doAction(t.Context(), "hub-run-1", "mika_run_task", runArgs)
