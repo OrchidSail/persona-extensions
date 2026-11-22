@@ -441,7 +441,7 @@ func TestManifest(t *testing.T) {
 	if err := json.Unmarshal(manifest, &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.ID != "mika" || m.Version != "0.2.0" {
+	if m.ID != "mika" || m.Version != "0.2.1" {
 		t.Fatalf("unexpected identity: %+v", m)
 	}
 	if len(m.Secrets) != 3 ||

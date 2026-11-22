@@ -677,6 +677,31 @@ func TestMultiDeviceUIViewsAndSwitching(t *testing.T) {
 		t.Fatalf("switched secondary view still showed primary task: %s", swJSON)
 	}
 
+	// Row action "device:<slot>" works even when client omits Action.Values or sends stale segmented value.
+	for _, vals := range []map[string]string{nil, {"device": slotPrimary}} {
+		rowSw, err := a.action(t.Context(), &ext.UIRequest{UIParams: wire.UIParams{
+			Locale: "zh-Hans", UIVersion: 6, Action: "device:" + slotSecondary, State: ov.State,
+			Values: vals,
+		}})
+		if err != nil || rowSw.View == nil || wire.CheckView(rowSw.View) != nil {
+			t.Fatalf("row switch device:secondary (vals=%v) failed: err=%v check=%v", vals, err, wire.CheckView(rowSw.View))
+		}
+		if b, _ := json.Marshal(rowSw.View); !strings.Contains(string(b), "s25-task-done-1") {
+			t.Fatalf("row switch device:secondary (vals=%v) did not select secondary: %s", vals, b)
+		}
+	}
+
+	// Row action "detail:<slot>:<task_id>" works even when client omits Action.Values.
+	rowDet, err := a.action(t.Context(), &ext.UIRequest{UIParams: wire.UIParams{
+		Locale: "zh-Hans", UIVersion: 6, Action: "detail:" + slotSecondary + ":s25-task-done-1", State: ov.State,
+	}})
+	if err != nil || rowDet.View == nil || wire.CheckView(rowDet.View) != nil {
+		t.Fatalf("row detail action failed: err=%v check=%v", err, wire.CheckView(rowDet.View))
+	}
+	if b, _ := json.Marshal(rowDet.View); !strings.Contains(string(b), "S25+ battery is at 88%") {
+		t.Fatalf("row detail view missing secondary answer: %s", b)
+	}
+
 	// Refresh preserves secondary device selection.
 	refRes, err := a.action(t.Context(), &ext.UIRequest{UIParams: wire.UIParams{
 		Locale: "zh-Hans", UIVersion: 6, Action: "refresh", State: swRes.View.State,

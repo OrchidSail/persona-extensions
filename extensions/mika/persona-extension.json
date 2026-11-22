@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "mika",
   "name": "Mika 手机助手",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "icon": "assets/icon.png",
   "description": "在 Persona 里通过局域网、Tailscale 或本机转发同时连接与管理多台安卓手机上的 Mika（/api/v1，支持最多 3 台命名设备独立令牌隔离）：检查服务与手机助手健康状态、查看只读设备状态与最近任务、导出脱敏运行记录；经确认后按设备派发手机任务、回复追问、运行中追加指示或取消任务。Bearer 令牌加密存在 hub，不执行远程解锁，付款与接管确认始终留在手机上。",
   "publisher": "nwverse",

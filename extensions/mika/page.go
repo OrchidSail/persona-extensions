@@ -65,9 +65,17 @@ func (a *app) action(ctx context.Context, r *ext.UIRequest) (*wire.ActionResult,
 	case r.Action == "refresh":
 		// Keep current mode, device, and task selection while re-fetching fresh state.
 	case r.Action == "device" || strings.HasPrefix(r.Action, "device:"):
-		slot := strings.TrimSpace(r.Values["device"])
-		if slot == "" && strings.HasPrefix(r.Action, "device:") {
+		var slot string
+		if strings.HasPrefix(r.Action, "device:") {
 			slot = strings.TrimSpace(strings.TrimPrefix(r.Action, "device:"))
+		}
+		if slot == "" {
+			slot = strings.TrimSpace(r.Values["device"])
+		}
+		if !isValidSlot(slot) && slot != "" {
+			if d, derr := a.snapshot().resolveDevice(slot); derr == nil {
+				slot = d.slot
+			}
 		}
 		if !isValidSlot(slot) {
 			return nil, fmt.Errorf("invalid device slot %q", slot)
@@ -84,12 +92,32 @@ func (a *app) action(ctx context.Context, r *ext.UIRequest) (*wire.ActionResult,
 			st.Pages++
 		}
 		st.Mode = "overview"
-	case r.Action == "detail":
-		id := strings.TrimSpace(r.Values["task_id"])
+	case r.Action == "detail" || strings.HasPrefix(r.Action, "detail:"):
+		var id, devSlot string
+		if strings.HasPrefix(r.Action, "detail:") {
+			rest := strings.TrimPrefix(r.Action, "detail:")
+			if pSlot, pID, ok := strings.Cut(rest, ":"); ok && isValidSlot(pSlot) && pID != "" {
+				devSlot = pSlot
+				id = pID
+			} else {
+				id = strings.TrimSpace(rest)
+			}
+		}
+		if id == "" {
+			id = strings.TrimSpace(r.Values["task_id"])
+		}
+		if devSlot == "" {
+			devSlot = strings.TrimSpace(r.Values["device"])
+		}
 		if err := validTaskID(id); err != nil {
 			return nil, err
 		}
-		if devSlot := strings.TrimSpace(r.Values["device"]); devSlot != "" {
+		if devSlot != "" {
+			if !isValidSlot(devSlot) {
+				if d, derr := a.snapshot().resolveDevice(devSlot); derr == nil {
+					devSlot = d.slot
+				}
+			}
 			if !isValidSlot(devSlot) {
 				return nil, fmt.Errorf("invalid device slot %q", devSlot)
 			}
@@ -259,7 +287,7 @@ func (a *app) overviewView(ctx context.Context, r *ext.UIRequest, st pageState, 
 				Type:   wire.ComponentRow,
 				Key:    "dev-" + d.slot,
 				Title:  clipText(rowTitle, 1800),
-				Action: &wire.Action{ID: "device", Values: map[string]string{"device": d.slot}},
+				Action: &wire.Action{ID: "device:" + d.slot, Values: map[string]string{"device": d.slot}},
 			}
 			switch {
 			case !d.ready():
@@ -443,13 +471,17 @@ func (a *app) overviewView(ctx context.Context, r *ext.UIRequest, st pageState, 
 			if multi {
 				vals["device"] = sel.slot
 			}
+			detailActionID := "detail:" + item.TaskID
+			if multi {
+				detailActionID = "detail:" + sel.slot + ":" + item.TaskID
+			}
 			taskSection.Items = append(taskSection.Items, wire.Component{
 				Type:     wire.ComponentRow,
 				Key:      "task-" + item.TaskID,
 				Title:    clipText(goal, 1800),
 				Subtitle: clipText(sub, 1800),
 				Badge:    &badge,
-				Action:   &wire.Action{ID: "detail", Values: vals},
+				Action:   &wire.Action{ID: detailActionID, Values: vals},
 			})
 		}
 		if len(taskSection.Items) == 0 {
