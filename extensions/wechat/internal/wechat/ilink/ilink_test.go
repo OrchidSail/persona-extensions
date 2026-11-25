@@ -454,6 +454,48 @@ func TestGetUpdates(t *testing.T) {
 	}
 }
 
+func TestDecodeSvrIDAndIncompleteQuote(t *testing.T) {
+	m := wireMessage{MessageID: json.RawMessage(`9007199254740993`), FromUserID: "owner@im", ContextToken: "CT", Items: []wireItem{{
+		Type: itemText, TextItem: &struct {
+			Text string `json:"text"`
+		}{Text: "reply"},
+	}}}
+	m.Items[0].RefMsg = &struct {
+		Title       string           `json:"title"`
+		MessageItem *wireItem        `json:"message_item"`
+		SvrID       json.RawMessage  `json:"svr_id"`
+		PartialText *wirePartialText `json:"partial_text"`
+	}{Title: "title", SvrID: json.RawMessage(`"4242"`)}
+	got, ok := decode(m)
+	if !ok || got.SvrID != "9007199254740993" || got.QuoteID != "4242" || got.Quote != "title" {
+		t.Fatalf("decoded ID-only quote = %+v, %v", got, ok)
+	}
+	m.Items[0].RefMsg.MessageItem = &wireItem{Type: itemText, TextItem: &struct {
+		Text string `json:"text"`
+	}{Text: "inline original"}}
+	got, ok = decode(m)
+	if !ok || got.QuoteID != "" || got.Quote != "title\ninline original" {
+		t.Fatalf("decoded inline quote = %+v, %v", got, ok)
+	}
+	m.Items[0].RefMsg.MessageItem = nil
+	m.Items[0].RefMsg.SvrID = json.RawMessage(`9007199254740994`)
+	got, ok = decode(m)
+	if !ok || got.QuoteID != "9007199254740994" {
+		t.Fatalf("decoded numeric svr_id = %+v, %v", got, ok)
+	}
+}
+
+func TestSendTextWithIDKeepsLargeServerID(t *testing.T) {
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ret":0,"message_id":18446744073709551615}`))
+	})
+	id, err := f.client("BT", "").SendTextWithID(context.Background(), "owner@im", "CT", "cid", "回答")
+	if err != nil || id != "18446744073709551615" {
+		t.Fatalf("server id = %q, error = %v", id, err)
+	}
+}
+
 func TestGetUpdatesTimeoutKeepsCursor(t *testing.T) {
 	f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
 		writeJSON(w, map[string]any{"ret": -1})
@@ -501,9 +543,12 @@ func TestLongPollEdge524(t *testing.T) {
 		t.Fatalf("fast 524 on GetUpdates should be retryable HTTP error, got %v", err)
 	}
 
-	// HTTP 524 on non-poll endpoints (such as SendText) still returns a retryable CodeHTTP error even if slow.
+	// HTTP 524 on non-poll endpoints (such as SendText and UploadImage) still returns a retryable CodeHTTP error even if slow.
 	if err := c.SendText(context.Background(), "owner@im", "CT", "cid", "hi"); CodeOf(err) != CodeHTTP || !Retryable(err) {
 		t.Fatalf("524 on SendText should be retryable HTTP error, got %v", err)
+	}
+	if _, err := c.UploadImage(context.Background(), "owner@im", []byte("png")); CodeOf(err) != CodeHTTP || !Retryable(err) {
+		t.Fatalf("524 on UploadImage should be retryable HTTP error, got %v", err)
 	}
 }
 
@@ -686,5 +731,132 @@ func TestChunk(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(joined, ""), "end") {
 		t.Error("lost the end")
+	}
+}
+
+// getuploadurl's full upload URL is taken only on a Tencent HTTPS origin; otherwise the picture goes to the CDN's
+// upload with the encrypted parameter, and with neither there is nowhere to upload.
+func TestUploadURL(t *testing.T) {
+	for _, ok := range []string{
+		"https://upload.weixin.qq.com/c2c/upload?x=1",
+		"https://upload.wechat.com/c2c/upload?x=1",
+		"https://novac2c.cdn.wechat.com/c2c/upload?x=1",
+		"https://wechat.com/c2c/upload?x=1",
+	} {
+		if got, err := uploadURL(ok, "", "FK"); err != nil || got != ok {
+			t.Errorf("Tencent full URL %s: %q %v", ok, got, err)
+		}
+	}
+	for _, bad := range []string{
+		"http://upload.weixin.qq.com/x",
+		"http://upload.wechat.com/x",
+		"https://evil.example/x",
+		"https://evilwechat.com/c2c/upload?encrypted_query_param=UPLOAD_SECRET",
+		"https://wechat.com.evil.com/x",
+		(&url.URL{Scheme: "https", User: url.UserPassword("u", "p"), Host: "upload.weixin.qq.com", Path: "/x"}).String(),
+		(&url.URL{
+			Scheme:   "https",
+			User:     url.UserPassword("u", "upload_pass"),
+			Host:     "upload.wechat.com",
+			Path:     "/secret_upload_path",
+			RawQuery: "encrypted_query_param=UPLOAD_SECRET",
+		}).String(),
+		"https://upload.weixin.qq.com:8443/x",
+		"https://upload.wechat.com:8443/x",
+	} {
+		_, err := uploadURL(bad, "P", "FK")
+		if CodeOf(err) != CodeProtocol {
+			t.Errorf("%s: %v", bad, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), "source=upload_url") ||
+			strings.Contains(err.Error(), "UPLOAD_SECRET") || strings.Contains(err.Error(), "upload_pass") || strings.Contains(err.Error(), "secret_upload_path") {
+			t.Errorf("upload URL diagnostic leaked secret for %s: %v", bad, err)
+		}
+	}
+	if got, err := uploadURL("", "a+b/c", "FK"); err != nil || got != "https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=a%2Bb%2Fc&filekey=FK" {
+		t.Errorf("param: %q %v", got, err)
+	}
+	if _, err := uploadURL("", "", "FK"); CodeOf(err) != CodeBadResponse {
+		t.Errorf("neither: %v", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestUploadAndSendImageInternationalWeChat(t *testing.T) {
+	var hosts []string
+	var uploadedCipher []byte
+	var sentImageItem map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ilink/bot/getuploadurl":
+			writeJSON(w, map[string]any{
+				"ret":             0,
+				"upload_full_url": "https://novac2c.cdn.wechat.com/c2c/upload?encrypted_query_param=UP-INTL&filekey=FK",
+			})
+		case "/c2c/upload":
+			b, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read upload body: %v", err)
+			}
+			uploadedCipher = b
+			w.Header().Set("x-encrypted-param", "DL-INTL")
+			w.WriteHeader(http.StatusOK)
+		case "/ilink/bot/sendmessage":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode sendmessage: %v", err)
+			}
+			msg := body["msg"].(map[string]any)
+			sentImageItem = msg["item_list"].([]any)[0].(map[string]any)["image_item"].(map[string]any)
+			writeJSON(w, map[string]any{"ret": 0})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	srvURL, _ := url.Parse(srv.URL)
+	c, err := New(Options{
+		BaseURL: "https://ilinkai.wechat.com/",
+		Token:   "BT-INTL",
+		Agent:   "Persona/1",
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			hosts = append(hosts, r.URL.Host)
+			r2 := r.Clone(r.Context())
+			r2.URL.Scheme, r2.URL.Host, r2.Host = srvURL.Scheme, srvURL.Host, srvURL.Host
+			return http.DefaultTransport.RoundTrip(r2)
+		})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := []byte("\x89PNG\r\n\x1a\ninternational wechat picture")
+	up, err := c.UploadImage(context.Background(), "owner@im", plain)
+	if err != nil {
+		t.Fatalf("UploadImage: %v", err)
+	}
+	if up.Query != "DL-INTL" || up.CipherSize != len(uploadedCipher) {
+		t.Fatalf("uploaded %+v, cipher len %d", up, len(uploadedCipher))
+	}
+	key, err := hex.DecodeString(up.KeyHex)
+	if err != nil {
+		t.Fatalf("key hex %q: %v", up.KeyHex, err)
+	}
+	gotPlain, err := DecryptECB(uploadedCipher, key)
+	if err != nil || !bytes.Equal(gotPlain, plain) {
+		t.Fatalf("decrypted %q %v", gotPlain, err)
+	}
+	if err := c.SendImage(context.Background(), "owner@im", "CT", "cid-img", up); err != nil {
+		t.Fatalf("SendImage: %v", err)
+	}
+	if len(hosts) != 3 || hosts[0] != "ilinkai.wechat.com" || hosts[1] != "novac2c.cdn.wechat.com" || hosts[2] != "ilinkai.wechat.com" {
+		t.Fatalf("hosts = %v", hosts)
+	}
+	if sentImageItem == nil || sentImageItem["media"].(map[string]any)["encrypt_query_param"] != "DL-INTL" {
+		t.Fatalf("sent image_item = %v", sentImageItem)
 	}
 }
