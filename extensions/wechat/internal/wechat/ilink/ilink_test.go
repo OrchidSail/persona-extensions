@@ -421,6 +421,8 @@ func TestGetUpdates(t *testing.T) {
 						"ref_msg": map[string]any{"title": "引用", "message_item": map[string]any{"type": 1, "text_item": map[string]any{"text": "原文"}}}},
 					map[string]any{"type": 3, "voice_item": map[string]any{"text": "语音转写", "media": map[string]any{"encrypt_query_param": "q", "aes_key": "k"}}},
 					map[string]any{"type": 2, "image_item": map[string]any{"aeskey": "00112233445566778899aabbccddeeff", "media": map[string]any{"full_url": "https://novac2c.cdn.weixin.qq.com/x"}}},
+					map[string]any{"type": 4, "file_item": map[string]any{"file_name": "report.pdf", "len": "123", "media": map[string]any{"encrypt_query_param": "fq", "aes_key": "file-key"}}},
+					map[string]any{"type": 5, "video_item": map[string]any{"media": map[string]any{"encrypt_query_param": "vq", "aes_key": "video-key"}}},
 				}},
 			map[string]any{"client_id": "c-1", "from_user_id": "x", "context_token": "CT2", "item_list": []any{}},
 			map[string]any{"message_id": "7", "from_user_id": "bot@im", "context_token": "CT", "message_type": 2},
@@ -439,7 +441,9 @@ func TestGetUpdates(t *testing.T) {
 	if m.ID != "message:42" || m.From != "owner@im" || m.ContextToken != "CT" || m.Text != "你好\n语音转写" || m.Quote != "引用\n原文" || m.At != 1000 {
 		t.Errorf("message %+v", m)
 	}
-	if len(m.Media) != 2 || m.Media[0].Kind != MediaVoice || m.Media[1].Kind != MediaImage || m.Media[1].KeyHex == "" {
+	if len(m.Media) != 4 || m.Media[0].Kind != MediaVoice || m.Media[1].Kind != MediaImage || m.Media[1].KeyHex == "" ||
+		m.Media[2] != (Media{Kind: MediaFile, Query: "fq", KeyB64: "file-key", FileName: "report.pdf", Size: 123}) ||
+		m.Media[3] != (Media{Kind: MediaVideo, Query: "vq", KeyB64: "video-key"}) {
 		t.Errorf("media %+v", m.Media)
 	}
 	if p.Messages[1].ID != "client:c-1" {
@@ -571,45 +575,85 @@ func TestDownload(t *testing.T) {
 	})
 	c := f.client("BT", "")
 	for _, m := range []Media{
-		{Query: "Q", KeyHex: hex.EncodeToString(key)},
-		{Query: "Q", KeyB64: base64.StdEncoding.EncodeToString(key)},
-		{Query: "Q", KeyB64: base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(key)))},
-		{URL: "https://novac2c.cdn.wechat.com/c2c/download?encrypted_query_param=Q", KeyHex: hex.EncodeToString(key)},
-		{URL: "https://wechat.com/c2c/download?encrypted_query_param=Q", KeyHex: hex.EncodeToString(key)},
+		{Kind: MediaFile, Query: "Q", KeyHex: hex.EncodeToString(key)},
+		{Kind: MediaVideo, Query: "Q", KeyB64: base64.StdEncoding.EncodeToString(key)},
+		{Kind: MediaFile, Query: "Q", KeyB64: base64.StdEncoding.EncodeToString([]byte(hex.EncodeToString(key)))},
+		{Kind: MediaImage, URL: "https://novac2c.cdn.wechat.com/c2c/download?encrypted_query_param=Q", KeyHex: hex.EncodeToString(key)},
+		{Kind: MediaFile, URL: "https://novac2c.cdn.wechat.com/c2c/download?encrypted_query_param=Q", KeyB64: base64.StdEncoding.EncodeToString(key)},
+		{Kind: MediaVideo, URL: "https://wechat.com/c2c/download?encrypted_query_param=Q", KeyB64: base64.StdEncoding.EncodeToString(key)},
 	} {
 		got, err := c.Download(context.Background(), m)
 		if err != nil || !bytes.Equal(got, plain) {
 			t.Errorf("%+v: %q %v", m, got, err)
 		}
 	}
-	if f.hosts[0] != "novac2c.cdn.weixin.qq.com" || f.hosts[3] != "novac2c.cdn.wechat.com" || f.hosts[4] != "wechat.com" {
+	if len(f.hosts) != 6 || f.hosts[0] != "novac2c.cdn.weixin.qq.com" ||
+		f.hosts[3] != "novac2c.cdn.wechat.com" || f.hosts[4] != "novac2c.cdn.wechat.com" || f.hosts[5] != "wechat.com" {
 		t.Errorf("host %v", f.hosts)
 	}
-	for _, bad := range []string{
-		"https://evil.example/x",
-		"https://evilwechat.com/c2c/download?encrypted_query_param=MEDIA_SECRET",
-		"https://wechat.com.evil.com/x",
-		"http://novac2c.cdn.wechat.com/x",
-		"https://novac2c.cdn.wechat.com:8443/x",
-		(&url.URL{
-			Scheme:   "https",
-			User:     url.UserPassword("u", "media_pass"),
-			Host:     "novac2c.cdn.wechat.com",
-			Path:     "/secret_path",
-			RawQuery: "encrypted_query_param=MEDIA_SECRET",
-		}).String(),
-	} {
-		_, err := c.Download(context.Background(), Media{URL: bad, KeyHex: hex.EncodeToString(key)})
-		if CodeOf(err) != CodeProtocol {
-			t.Errorf("bad media URL %s: %v", bad, err)
-			continue
-		}
-		if strings.Contains(err.Error(), "MEDIA_SECRET") || strings.Contains(err.Error(), "media_pass") || strings.Contains(err.Error(), "secret_path") {
-			t.Errorf("media URL diagnostic leaked secret for %s: %v", bad, err)
+	for _, kind := range []MediaKind{MediaImage, MediaFile, MediaVideo} {
+		for _, bad := range []string{
+			"https://evil.example/x",
+			"https://evilwechat.com/c2c/download?encrypted_query_param=MEDIA_SECRET",
+			"https://wechat.com.evil.com/x",
+			"http://novac2c.cdn.wechat.com/x",
+			"https://novac2c.cdn.wechat.com:8443/x",
+			(&url.URL{
+				Scheme:   "https",
+				User:     url.UserPassword("u", "media_pass"),
+				Host:     "novac2c.cdn.wechat.com",
+				Path:     "/secret_path",
+				RawQuery: "encrypted_query_param=MEDIA_SECRET",
+			}).String(),
+		} {
+			_, err := c.Download(context.Background(), Media{Kind: kind, URL: bad, KeyHex: hex.EncodeToString(key)})
+			if CodeOf(err) != CodeProtocol {
+				t.Errorf("bad %s media URL %s: %v", kind, bad, err)
+				continue
+			}
+			if !strings.Contains(err.Error(), "source=media_url") ||
+				strings.Contains(err.Error(), "MEDIA_SECRET") || strings.Contains(err.Error(), "media_pass") || strings.Contains(err.Error(), "secret_path") {
+				t.Errorf("media URL diagnostic leaked secret for %s %s: %v", kind, bad, err)
+			}
 		}
 	}
 	if _, err := DecryptECB(enc[:16], key); err == nil {
 		t.Error("bad padding accepted")
+	}
+}
+
+func TestDownloadFileAndVideoSizeLimits(t *testing.T) {
+	key, _ := hex.DecodeString("00112233445566778899aabbccddeeff")
+	tests := []struct {
+		name, query string
+		kind        MediaKind
+		size        int
+		ok          bool
+	}{
+		{name: "file at the message budget", query: "at", kind: MediaFile, size: 40 << 20, ok: true},
+		{name: "one byte over", query: "over", kind: MediaFile, size: 40<<20 + 1},
+		{name: "video over the picture limit", query: "video", kind: MediaVideo, size: 9 << 20, ok: true},
+	}
+	downloads := map[string][]byte{}
+	for _, tt := range tests {
+		enc, err := EncryptECB(make([]byte, tt.size), key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		downloads[tt.query] = enc
+	}
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, _ map[string]any) {
+		_, _ = w.Write(downloads[r.URL.Query().Get("encrypted_query_param")])
+	})
+	c := f.client("BT", "")
+	for _, tt := range tests {
+		got, err := c.Download(context.Background(), Media{Kind: tt.kind, Query: tt.query, KeyB64: base64.StdEncoding.EncodeToString(key)})
+		if tt.ok && (err != nil || len(got) != tt.size) {
+			t.Errorf("%s: decrypted %d bytes, want %d; error=%v", tt.name, len(got), tt.size, err)
+		}
+		if !tt.ok && (err == nil || CodeOf(err) != CodeBadResponse || got != nil) {
+			t.Errorf("%s: decrypted %d bytes, error=%v; want media-too-large rejection", tt.name, len(got), err)
+		}
 	}
 }
 
