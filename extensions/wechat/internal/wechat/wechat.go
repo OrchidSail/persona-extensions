@@ -71,8 +71,14 @@ type Bot struct {
 	replied map[string]time.Time
 	quotes  *quoteStore
 	// progress is how far each ref's channel.send got, oldest ref first in progressOrder (chat.go sendProgress).
-	progress      map[string]*sendProgress
+	progress      map[string]sendProgress
 	progressOrder []string
+	// sendGen counts binding changes that dropped the progress (forgetSendsLocked): a send keeps or reads progress
+	// only in the generation it started in.
+	sendGen uint64
+	// rounds are the latest round of each ref's send, oldest ref first in roundOrder (chat.go roundLocked).
+	rounds     map[string]sendRound
+	roundOrder []string
 }
 
 // state is what is kept in the hub (sealed): never logged.
@@ -285,6 +291,7 @@ func (b *Bot) unbind(ctx context.Context, token string) {
 	b.st.Old = rememberToken(b.st.Old, b.st.Creds.Token)
 	b.st.Creds, b.st.Cursor, b.st.Context = nil, "", ""
 	b.typing = nil
+	b.forgetSendsLocked()
 	b.saveLocked(ctx)
 	if b.quotes != nil {
 		b.quotes.reset()
