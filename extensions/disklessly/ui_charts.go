@@ -334,10 +334,10 @@ func healthLevelText(level string) string {
 func healthWatermarkNote(level string, usedPct float64, totalBytes, availBytes uint64) string {
 	base := healthLevelText(level)
 	if level == HealthCritical && usedPct < 90.0 && totalBytes >= 20*gib && availBytes < 10*gib {
-		return fmt.Sprintf("%s，只剩 %s（不到 10 GiB）", base, FormatBytes(availBytes))
+		return fmt.Sprintf("%s，只剩 %s，不到 10 GiB", base, FormatBytes(availBytes))
 	}
 	if level == HealthWarning && usedPct < 80.0 && totalBytes >= 50*gib && availBytes < 25*gib {
-		return fmt.Sprintf("%s，只剩 %s（不到 25 GiB）", base, FormatBytes(availBytes))
+		return fmt.Sprintf("%s，只剩 %s，不到 25 GiB", base, FormatBytes(availBytes))
 	}
 	return base
 }
@@ -628,7 +628,7 @@ func machinePlainTextSummary(ms MachineStatus, scan *Scan) string {
 		catLine = "能删的：" + strings.Join(catParts, "、")
 	}
 	if lastKnown(ms) {
-		name += "（现在连不上，下面是上次检查的数）"
+		name += "（" + offlineText + "，下面是上次检查的数）"
 	}
 	return fmt.Sprintf("%s [%s %.1f%%] 系统盘 %s 用了 %s / %s，还剩 %s，可以腾出 %s（其中放心删 %s）；%s",
 		name, healthLevelText(fullnessLevel(ms)), ms.UsedPercent, mp,
